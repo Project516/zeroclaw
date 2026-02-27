@@ -31,7 +31,7 @@ Build với `--features hardware` (hoặc features mặc định) để bao gồ
 
 ### 1.1 Cấu hình Uno Q qua App Lab
 
-1. Tải [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) (AppImage trên Linux).
+1. Tải [Arduino App Lab](https://docs.arduino.cc/software/app-lab/) (tar.gz trên Linux).
 2. Kết nối Uno Q qua USB, bật nguồn.
 3. Mở App Lab, kết nối với board.
 4. Làm theo hướng dẫn cài đặt:
