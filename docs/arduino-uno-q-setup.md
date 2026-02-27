@@ -199,7 +199,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 2 | `ssh arduino@<IP>` |
 | 3 | `curl -sSf https://sh.rustup.rs \| sh -s -- -y && source ~/.cargo/env` |
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
-| 5 | `git clone https://github.com/theonlyhennygod/zeroclaw.git && cd zeroclaw` |
+| 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
 | 6 | `cargo build --release --features hardware` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
 | 8 | Edit `~/.zeroclaw/config.toml` (add Telegram bot_token) |
