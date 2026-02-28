@@ -6,6 +6,7 @@ use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -236,6 +237,11 @@ pub struct Config {
     #[serde(default)]
     pub cost: CostConfig,
 
+    /// Economic agent survival tracking (`[economic]`).
+    /// Tracks balance, token costs, work income, and survival status.
+    #[serde(default)]
+    pub economic: EconomicConfig,
+
     /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
@@ -252,6 +258,10 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// Plugin system configuration (discovery, loading, per-plugin config).
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -264,12 +274,20 @@ pub struct Config {
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
 
+    /// External MCP server connections (`[mcp]`).
+    #[serde(default, alias = "mcpServers")]
+    pub mcp: McpConfig,
+
     /// Vision support override for the active provider/model.
     /// - `None` (default): use provider's built-in default
     /// - `Some(true)`: force vision support on (e.g. Ollama running llava)
     /// - `Some(false)`: force vision support off
     #[serde(default)]
     pub model_support_vision: Option<bool>,
+
+    /// WASM plugin engine configuration (`[wasm]` section).
+    #[serde(default)]
+    pub wasm: WasmConfig,
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
@@ -296,6 +314,20 @@ pub struct ProviderConfig {
     /// (e.g. OpenAI Codex `/responses` reasoning effort).
     #[serde(default)]
     pub reasoning_level: Option<String>,
+    /// Optional transport override for providers that support multiple transports.
+    /// Supported values: "auto", "websocket", "sse".
+    ///
+    /// Resolution order:
+    /// 1) `model_routes[].transport` (route-specific)
+    /// 2) env overrides (`PROVIDER_TRANSPORT`, `ZEROCLAW_PROVIDER_TRANSPORT`, `ZEROCLAW_CODEX_TRANSPORT`)
+    /// 3) `provider.transport`
+    /// 4) runtime default (`auto`, WebSocket-first with SSE fallback for OpenAI Codex)
+    ///
+    /// Note: env overrides replace configured `provider.transport` when set.
+    ///
+    /// Existing configs that omit `provider.transport` remain valid and fall back to defaults.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -495,6 +527,11 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
+    /// API key used for transcription requests.
+    ///
+    /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Whisper API endpoint URL.
     #[serde(default = "default_transcription_api_url")]
     pub api_url: String,
@@ -513,12 +550,67 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            api_key: None,
             api_url: default_transcription_api_url(),
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
+}
+
+// ── MCP ─────────────────────────────────────────────────────────
+
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for a single external MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpServerConfig {
+    /// Display name used as a tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type (default: stdio).
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable to spawn for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Command arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables for stdio transport.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds (hard capped in validation).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    /// Enable MCP tool loading.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default, alias = "mcpServers")]
+    pub servers: Vec<McpServerConfig>,
 }
 
 // ── Agents IPC ──────────────────────────────────────────────────
@@ -641,6 +733,21 @@ pub struct AgentConfig {
     /// Tool dispatch strategy (e.g. `"auto"`). Default: `"auto"`.
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Loop detection: no-progress repeat threshold.
+    /// Triggers when the same tool+args produces identical output this many times.
+    /// Set to `0` to disable. Default: `3`.
+    #[serde(default = "default_loop_detection_no_progress_threshold")]
+    pub loop_detection_no_progress_threshold: usize,
+    /// Loop detection: ping-pong cycle threshold.
+    /// Detects A→B→A→B alternating patterns with no progress.
+    /// Value is number of full cycles (A-B = 1 cycle). Set to `0` to disable. Default: `2`.
+    #[serde(default = "default_loop_detection_ping_pong_cycles")]
+    pub loop_detection_ping_pong_cycles: usize,
+    /// Loop detection: consecutive failure streak threshold.
+    /// Triggers when the same tool fails this many times in a row.
+    /// Set to `0` to disable. Default: `3`.
+    #[serde(default = "default_loop_detection_failure_streak")]
+    pub loop_detection_failure_streak: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -655,14 +762,29 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_loop_detection_no_progress_threshold() -> usize {
+    3
+}
+
+fn default_loop_detection_ping_pong_cycles() -> usize {
+    2
+}
+
+fn default_loop_detection_failure_streak() -> usize {
+    3
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            compact_context: false,
+            compact_context: true,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            loop_detection_no_progress_threshold: default_loop_detection_no_progress_threshold(),
+            loop_detection_ping_pong_cycles: default_loop_detection_ping_pong_cycles(),
+            loop_detection_failure_streak: default_loop_detection_failure_streak(),
         }
     }
 }
@@ -697,10 +819,66 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Allow script-like files in skills (`.sh`, `.bash`, `.ps1`, shebang shell files).
+    /// Default: `false` (secure by default).
+    #[serde(default)]
+    pub allow_scripts: bool,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
+    /// Optional ClawhHub API token for authenticated skill downloads.
+    /// Obtain from https://clawhub.ai after signing in.
+    /// Set via config: `clawhub_token = "..."` under `[skills]`.
+    #[serde(default)]
+    pub clawhub_token: Option<String>,
+}
+
+/// WASM plugin engine configuration (`[wasm]` section).
+///
+/// Controls limits applied to every WASM tool invocation.
+/// Requires the `wasm-tools` compile-time feature to have any effect.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WasmConfig {
+    /// Enable loading WASM tools from installed skill packages.
+    /// Default: `true` (auto-discovers plugins in the skills directory).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum linear memory per WASM invocation in MiB.
+    /// Valid range: 1..=256. Default: `64`.
+    #[serde(default = "default_wasm_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// CPU fuel budget per invocation (roughly one unit ≈ one WASM instruction).
+    /// Default: 1_000_000_000.
+    #[serde(default = "default_wasm_fuel_limit")]
+    pub fuel_limit: u64,
+    /// URL of the ZeroMarket (or compatible) registry used by `zeroclaw skill install`.
+    /// Default: the public ZeroMarket registry.
+    #[serde(default = "default_registry_url")]
+    pub registry_url: String,
+}
+
+fn default_wasm_memory_limit_mb() -> u64 {
+    64
+}
+
+fn default_wasm_fuel_limit() -> u64 {
+    1_000_000_000
+}
+
+fn default_registry_url() -> String {
+    "https://zeromarket.vercel.app/api".to_string()
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_wasm_fuel_limit(),
+            registry_url: default_registry_url(),
+        }
+    }
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
@@ -754,6 +932,11 @@ pub struct IdentityConfig {
     /// Identity format: "openclaw" (default) or "aieos"
     #[serde(default = "default_identity_format")]
     pub format: String,
+    /// Additional workspace files injected for the OpenClaw identity format.
+    ///
+    /// Paths are resolved relative to the workspace root.
+    #[serde(default)]
+    pub extra_files: Vec<String>,
     /// Path to AIEOS JSON file (relative to workspace)
     #[serde(default)]
     pub aieos_path: Option<String>,
@@ -770,6 +953,7 @@ impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
             format: default_identity_format(),
+            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: None,
         }
@@ -952,6 +1136,83 @@ pub struct PeripheralBoardConfig {
     /// Baud rate for serial (default: 115200)
     #[serde(default = "default_peripheral_baud")]
     pub baud: u32,
+}
+
+// ── Economic Agent Config ─────────────────────────────────────────
+
+/// Token pricing configuration for economic tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EconomicTokenPricing {
+    /// Price per million input tokens (USD)
+    #[serde(default = "default_input_price")]
+    pub input_price_per_million: f64,
+    /// Price per million output tokens (USD)
+    #[serde(default = "default_output_price")]
+    pub output_price_per_million: f64,
+}
+
+fn default_input_price() -> f64 {
+    3.0 // Claude Sonnet 4 input price
+}
+
+fn default_output_price() -> f64 {
+    15.0 // Claude Sonnet 4 output price
+}
+
+impl Default for EconomicTokenPricing {
+    fn default() -> Self {
+        Self {
+            input_price_per_million: default_input_price(),
+            output_price_per_million: default_output_price(),
+        }
+    }
+}
+
+/// Economic agent survival tracking configuration (`[economic]` section).
+///
+/// Implements the ClawWork economic model for AI agents, tracking
+/// balance, costs, income, and survival status.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EconomicConfig {
+    /// Enable economic tracking (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Starting balance in USD (default: 1000.0)
+    #[serde(default = "default_initial_balance")]
+    pub initial_balance: f64,
+
+    /// Token pricing configuration
+    #[serde(default)]
+    pub token_pricing: EconomicTokenPricing,
+
+    /// Minimum evaluation score (0.0-1.0) to receive payment (default: 0.6)
+    #[serde(default = "default_min_evaluation_threshold")]
+    pub min_evaluation_threshold: f64,
+
+    /// Data directory for economic state persistence (relative to workspace)
+    #[serde(default)]
+    pub data_path: Option<String>,
+}
+
+fn default_initial_balance() -> f64 {
+    1000.0
+}
+
+fn default_min_evaluation_threshold() -> f64 {
+    0.6
+}
+
+impl Default for EconomicConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initial_balance: default_initial_balance(),
+            token_pricing: EconomicTokenPricing::default(),
+            min_evaluation_threshold: default_min_evaluation_threshold(),
+            data_path: None,
+        }
+    }
 }
 
 fn default_peripheral_transport() -> String {
@@ -1206,12 +1467,28 @@ pub struct BrowserConfig {
     /// Allowed domains for `browser_open` (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Browser for browser_open tool: "disable" | "brave" | "chrome" | "firefox" | "edge" | "msedge" | "default"
+    #[serde(default = "default_browser_open")]
+    pub browser_open: String,
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Auto backend priority order (only used when backend = "auto")
+    /// Supported values: "agent_browser", "rust_native", "computer_use"
+    #[serde(default)]
+    pub auto_backend_priority: Vec<String>,
+    /// Agent-browser executable path/name
+    #[serde(default = "default_agent_browser_command")]
+    pub agent_browser_command: String,
+    /// Additional arguments passed to agent-browser before each action command
+    #[serde(default)]
+    pub agent_browser_extra_args: Vec<String>,
+    /// Timeout in milliseconds for each agent-browser command invocation
+    #[serde(default = "default_agent_browser_timeout_ms")]
+    pub agent_browser_timeout_ms: u64,
     /// Headless mode for rust-native backend
     #[serde(default = "default_true")]
     pub native_headless: bool,
@@ -1230,6 +1507,18 @@ fn default_browser_backend() -> String {
     "agent_browser".into()
 }
 
+fn default_agent_browser_command() -> String {
+    "agent-browser".into()
+}
+
+fn default_agent_browser_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_browser_open() -> String {
+    "default".into()
+}
+
 fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
@@ -1239,8 +1528,13 @@ impl Default for BrowserConfig {
         Self {
             enabled: false,
             allowed_domains: Vec::new(),
+            browser_open: default_browser_open(),
             session_name: None,
             backend: default_browser_backend(),
+            auto_backend_priority: Vec::new(),
+            agent_browser_command: default_agent_browser_command(),
+            agent_browser_extra_args: Vec::new(),
+            agent_browser_timeout_ms: default_agent_browser_timeout_ms(),
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
@@ -1306,10 +1600,11 @@ pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
     #[serde(default)]
     pub enabled: bool,
-    /// Provider: "fast_html2md", "nanohtml2text", or "firecrawl"
+    /// Provider: "fast_html2md", "nanohtml2text", "firecrawl", or "tavily"
     #[serde(default = "default_web_fetch_provider")]
     pub provider: String,
-    /// Optional provider API key (required for provider = "firecrawl")
+    /// Optional provider API key (required for provider = "firecrawl" or "tavily").
+    /// Multiple keys can be comma-separated for round-robin load balancing.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Optional provider API URL override (for self-hosted providers)
@@ -1368,10 +1663,12 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo"/"ddg" (free, no API key), "brave", "firecrawl",
+    /// "tavily", "perplexity", "exa", or "jina"
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
-    /// Generic provider API key (used by firecrawl and as fallback for brave)
+    /// Generic provider API key (used by firecrawl, tavily, and as fallback for brave).
+    /// Multiple keys can be comma-separated for round-robin load balancing.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Optional provider API URL override (for self-hosted providers)
@@ -1380,6 +1677,52 @@ pub struct WebSearchConfig {
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// Perplexity API key (used when provider is "perplexity")
+    #[serde(default)]
+    pub perplexity_api_key: Option<String>,
+    /// Exa API key (used when provider is "exa")
+    #[serde(default)]
+    pub exa_api_key: Option<String>,
+    /// Jina API key (optional; can raise limits for provider = "jina")
+    #[serde(default)]
+    pub jina_api_key: Option<String>,
+    /// Fallback providers attempted after primary provider fails.
+    /// Supported values: duckduckgo (or ddg), brave, firecrawl, tavily, perplexity, exa, jina
+    #[serde(default)]
+    pub fallback_providers: Vec<String>,
+    /// Retry count per provider before falling back to next provider
+    #[serde(default = "default_web_search_retries_per_provider")]
+    pub retries_per_provider: u32,
+    /// Retry backoff in milliseconds between provider retry attempts
+    #[serde(default = "default_web_search_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    /// Optional domain filter forwarded to providers that support it
+    #[serde(default)]
+    pub domain_filter: Vec<String>,
+    /// Optional language filter forwarded to providers that support it
+    #[serde(default)]
+    pub language_filter: Vec<String>,
+    /// Optional country filter forwarded to providers that support it (e.g. "US")
+    #[serde(default)]
+    pub country: Option<String>,
+    /// Optional recency filter forwarded to providers that support it
+    #[serde(default)]
+    pub recency_filter: Option<String>,
+    /// Optional max tokens cap used by provider-specific APIs (for example Perplexity)
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Optional per-result token cap used by provider-specific APIs
+    #[serde(default)]
+    pub max_tokens_per_page: Option<u32>,
+    /// Exa search type override: "auto" (default), "keyword", or "neural"
+    #[serde(default = "default_web_search_exa_search_type")]
+    pub exa_search_type: String,
+    /// Include textual content payloads for Exa search responses
+    #[serde(default)]
+    pub exa_include_text: bool,
+    /// Optional site filters for Jina search provider
+    #[serde(default)]
+    pub jina_site_filters: Vec<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -1403,6 +1746,81 @@ fn default_web_search_timeout_secs() -> u64 {
     15
 }
 
+fn default_web_search_retries_per_provider() -> u32 {
+    0
+}
+
+fn default_web_search_retry_backoff_ms() -> u64 {
+    250
+}
+
+fn default_web_search_exa_search_type() -> String {
+    "auto".into()
+}
+
+const BROWSER_OPEN_ALLOWED_VALUES: &[&str] = &[
+    "disable", "brave", "chrome", "firefox", "edge", "msedge", "default",
+];
+const BROWSER_BACKEND_ALLOWED_VALUES: &[&str] =
+    &["agent_browser", "rust_native", "computer_use", "auto"];
+const BROWSER_AUTO_BACKEND_ALLOWED_VALUES: &[&str] =
+    &["agent_browser", "rust_native", "computer_use"];
+const WEB_SEARCH_PROVIDER_ALLOWED_VALUES: &[&str] = &[
+    "duckduckgo",
+    "ddg",
+    "brave",
+    "firecrawl",
+    "tavily",
+    "perplexity",
+    "exa",
+    "jina",
+];
+const WEB_SEARCH_EXA_SEARCH_TYPE_ALLOWED_VALUES: &[&str] = &["auto", "keyword", "neural"];
+
+fn normalize_browser_open_choice(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "disable" => Some("disable"),
+        "brave" => Some("brave"),
+        "chrome" => Some("chrome"),
+        "firefox" => Some("firefox"),
+        "edge" | "msedge" => Some("edge"),
+        "default" | "" => Some("default"),
+        _ => None,
+    }
+}
+
+fn normalize_browser_backend(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "agent_browser" | "agentbrowser" => Some("agent_browser"),
+        "rust_native" | "native" => Some("rust_native"),
+        "computer_use" | "computeruse" => Some("computer_use"),
+        "auto" => Some("auto"),
+        _ => None,
+    }
+}
+
+fn normalize_browser_auto_backend(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "agent_browser" | "agentbrowser" => Some("agent_browser"),
+        "rust_native" | "native" => Some("rust_native"),
+        "computer_use" | "computeruse" => Some("computer_use"),
+        _ => None,
+    }
+}
+
+fn normalize_web_search_provider(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "duckduckgo" | "ddg" => Some("duckduckgo"),
+        "brave" => Some("brave"),
+        "firecrawl" => Some("firecrawl"),
+        "tavily" => Some("tavily"),
+        "perplexity" => Some("perplexity"),
+        "exa" => Some("exa"),
+        "jina" => Some("jina"),
+        _ => None,
+    }
+}
+
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
@@ -1411,6 +1829,21 @@ impl Default for WebSearchConfig {
             api_key: None,
             api_url: None,
             brave_api_key: None,
+            perplexity_api_key: None,
+            exa_api_key: None,
+            jina_api_key: None,
+            fallback_providers: Vec::new(),
+            retries_per_provider: default_web_search_retries_per_provider(),
+            retry_backoff_ms: default_web_search_retry_backoff_ms(),
+            domain_filter: Vec::new(),
+            language_filter: Vec::new(),
+            country: None,
+            recency_filter: None,
+            max_tokens: None,
+            max_tokens_per_page: None,
+            exa_search_type: default_web_search_exa_search_type(),
+            exa_include_text: false,
+            jina_site_filters: Vec::new(),
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
             user_agent: default_user_agent(),
@@ -1732,6 +2165,29 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_cidr_notation(raw: &str) -> Result<(IpAddr, u8)> {
+    let (ip_raw, prefix_raw) = raw
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("missing '/' separator"))?;
+    let ip: IpAddr = ip_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid IP address '{ip_raw}'"))?;
+    let prefix: u8 = prefix_raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid prefix '{prefix_raw}'"))?;
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        anyhow::bail!("prefix {prefix} exceeds max {max_prefix} for {ip}");
+    }
+    Ok((ip, prefix))
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -1968,7 +2424,7 @@ impl Default for StorageProviderConfig {
 /// Controls conversation memory storage, embeddings, hybrid search, response caching,
 /// and memory snapshot/hydration.
 /// Configuration for Qdrant vector database backend (`[memory.qdrant]`).
-/// Used when `[memory].backend = "qdrant"`.
+/// Used when `[memory].backend = "qdrant"` or `"sqlite_qdrant_hybrid"`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QdrantConfig {
     /// Qdrant server URL (e.g. "http://localhost:6333").
@@ -2002,10 +2458,10 @@ impl Default for QdrantConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "sqlite_qdrant_hybrid" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
-    /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
+    /// `qdrant` and `sqlite_qdrant_hybrid` use `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
@@ -2078,7 +2534,7 @@ pub struct MemoryConfig {
 
     // ── Qdrant backend options ─────────────────────────────────
     /// Configuration for Qdrant vector database backend.
-    /// Only used when `backend = "qdrant"`.
+    /// Used when `backend = "qdrant"` or `backend = "sqlite_qdrant_hybrid"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
 }
@@ -2238,6 +2694,87 @@ pub struct BuiltinHooksConfig {
     pub command_logger: bool,
 }
 
+// ── Plugin system ─────────────────────────────────────────────────────────────
+
+/// Plugin system configuration (`[plugins]` section).
+///
+/// Controls plugin discovery, loading, and per-plugin settings.
+/// Mirrors OpenClaw's `plugins` config block.
+///
+/// Example:
+/// ```toml
+/// [plugins]
+/// enabled = true
+/// allow = ["hello-world"]
+///
+/// [plugins.entries.hello-world]
+/// enabled = true
+///
+/// [plugins.entries.hello-world.config]
+/// greeting = "Howdy"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsConfig {
+    /// Master switch — set to `false` to disable all plugin loading. Default: `true`.
+    #[serde(default = "default_plugins_enabled")]
+    pub enabled: bool,
+
+    /// Allowlist — if non-empty, only plugins with these IDs are loaded.
+    /// An empty list means all discovered plugins are eligible.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Denylist — plugins with these IDs are never loaded, even if in the allowlist.
+    #[serde(default)]
+    pub deny: Vec<String>,
+
+    /// Extra directories to scan for plugins (in addition to the standard locations).
+    /// Standard locations: `<binary_dir>/extensions/`, `~/.zeroclaw/extensions/`,
+    /// `<workspace>/.zeroclaw/extensions/`.
+    #[serde(default)]
+    pub load_paths: Vec<String>,
+
+    /// Per-plugin configuration entries.
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, PluginEntryConfig>,
+}
+
+fn default_plugins_enabled() -> bool {
+    true
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            load_paths: Vec::new(),
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Per-plugin configuration entry (`[plugins.entries.<id>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginEntryConfig {
+    /// Override the plugin's enabled state. If absent, the plugin is enabled
+    /// unless it is bundled-and-disabled-by-default.
+    pub enabled: Option<bool>,
+
+    /// Plugin-specific configuration table, passed to `PluginApi::plugin_config()`.
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+impl Default for PluginEntryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
 // ── Autonomy / Security ──────────────────────────────────────────
 
 /// Natural-language behavior for non-CLI approval-management commands.
@@ -2375,6 +2912,8 @@ fn default_non_cli_excluded_tools() -> Vec<String> {
         "memory_store",
         "memory_forget",
         "proxy_config",
+        "web_search_config",
+        "web_access_config",
         "model_routing_config",
         "pushover",
         "composio",
@@ -2524,11 +3063,11 @@ pub struct WasmRuntimeConfig {
     pub tools_dir: String,
 
     /// Fuel limit per invocation (instruction budget).
-    #[serde(default = "default_wasm_fuel_limit")]
+    #[serde(default = "default_runtime_wasm_fuel_limit")]
     pub fuel_limit: u64,
 
     /// Memory limit per invocation in MB.
-    #[serde(default = "default_wasm_memory_limit_mb")]
+    #[serde(default = "default_runtime_wasm_memory_limit_mb")]
     pub memory_limit_mb: u64,
 
     /// Maximum `.wasm` module size in MB.
@@ -2633,11 +3172,11 @@ fn default_wasm_tools_dir() -> String {
     "tools/wasm".into()
 }
 
-fn default_wasm_fuel_limit() -> u64 {
+fn default_runtime_wasm_fuel_limit() -> u64 {
     1_000_000
 }
 
-fn default_wasm_memory_limit_mb() -> u64 {
+fn default_runtime_wasm_memory_limit_mb() -> u64 {
     64
 }
 
@@ -2663,8 +3202,8 @@ impl Default for WasmRuntimeConfig {
     fn default() -> Self {
         Self {
             tools_dir: default_wasm_tools_dir(),
-            fuel_limit: default_wasm_fuel_limit(),
-            memory_limit_mb: default_wasm_memory_limit_mb(),
+            fuel_limit: default_runtime_wasm_fuel_limit(),
+            memory_limit_mb: default_runtime_wasm_memory_limit_mb(),
             max_module_size_mb: default_wasm_max_module_size_mb(),
             allow_workspace_read: false,
             allow_workspace_write: false,
@@ -2954,6 +3493,14 @@ pub struct ModelRouteConfig {
     /// Optional API key override for this route's provider
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Optional route-specific transport override for this route.
+    /// Supported values: "auto", "websocket", "sse".
+    ///
+    /// When `model_routes[].transport` is unset, the route inherits `provider.transport`.
+    /// If both are unset, runtime defaults are used (`auto` for OpenAI Codex).
+    /// Existing configs without this field remain valid.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
@@ -4114,6 +4661,10 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub otp: OtpConfig,
 
+    /// Custom security role definitions used for user-level tool authorization.
+    #[serde(default)]
+    pub roles: Vec<SecurityRoleConfig>,
+
     /// Emergency-stop state machine configuration.
     #[serde(default)]
     pub estop: EstopConfig,
@@ -4121,6 +4672,129 @@ pub struct SecurityConfig {
     /// Syscall anomaly detection profile for daemon shell/process execution.
     #[serde(default)]
     pub syscall_anomaly: SyscallAnomalyConfig,
+
+    /// Lightweight statistical filter for adversarial suffixes (opt-in).
+    #[serde(default)]
+    pub perplexity_filter: PerplexityFilterConfig,
+
+    /// Shared URL access policy for network-enabled tools.
+    #[serde(default)]
+    pub url_access: UrlAccessConfig,
+}
+
+/// Lightweight perplexity-style filter configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PerplexityFilterConfig {
+    /// Enable probabilistic adversarial suffix filtering before provider calls.
+    #[serde(default)]
+    pub enable_perplexity_filter: bool,
+
+    /// Character-class bigram perplexity threshold for anomaly blocking.
+    #[serde(default = "default_perplexity_threshold")]
+    pub perplexity_threshold: f64,
+
+    /// Number of trailing characters sampled for suffix anomaly scoring.
+    #[serde(default = "default_perplexity_suffix_window_chars")]
+    pub suffix_window_chars: usize,
+
+    /// Minimum input length before running the perplexity filter.
+    #[serde(default = "default_perplexity_min_prompt_chars")]
+    pub min_prompt_chars: usize,
+
+    /// Minimum punctuation ratio in the sampled suffix required to block.
+    #[serde(default = "default_perplexity_symbol_ratio_threshold")]
+    pub symbol_ratio_threshold: f64,
+}
+
+fn default_perplexity_threshold() -> f64 {
+    18.0
+}
+
+fn default_perplexity_suffix_window_chars() -> usize {
+    64
+}
+
+fn default_perplexity_min_prompt_chars() -> usize {
+    32
+}
+
+fn default_perplexity_symbol_ratio_threshold() -> f64 {
+    0.20
+}
+
+impl Default for PerplexityFilterConfig {
+    fn default() -> Self {
+        Self {
+            enable_perplexity_filter: false,
+            perplexity_threshold: default_perplexity_threshold(),
+            suffix_window_chars: default_perplexity_suffix_window_chars(),
+            min_prompt_chars: default_perplexity_min_prompt_chars(),
+            symbol_ratio_threshold: default_perplexity_symbol_ratio_threshold(),
+        }
+    }
+}
+
+/// Shared URL validation configuration used by network tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UrlAccessConfig {
+    /// Block private/local IPs and hostnames by default.
+    #[serde(default = "default_true")]
+    pub block_private_ip: bool,
+
+    /// Explicit CIDR ranges that bypass private/local-IP blocking.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+
+    /// Explicit domain patterns that bypass private/local-IP blocking.
+    /// Supports exact, `*.example.com`, and `*`.
+    #[serde(default)]
+    pub allow_domains: Vec<String>,
+
+    /// Allow loopback host/IP access (`localhost`, `127.0.0.1`, `::1`).
+    #[serde(default)]
+    pub allow_loopback: bool,
+
+    /// Require explicit human confirmation before first-time access to an
+    /// unseen domain. Confirmed domains are persisted in `approved_domains`.
+    #[serde(default)]
+    pub require_first_visit_approval: bool,
+
+    /// Enforce a global domain allowlist in addition to per-tool allowlists.
+    /// When enabled, hosts must match `domain_allowlist`.
+    #[serde(default)]
+    pub enforce_domain_allowlist: bool,
+
+    /// Global trusted domain allowlist shared by all URL-based network tools.
+    /// Supports exact, `*.example.com`, and `*`.
+    #[serde(default)]
+    pub domain_allowlist: Vec<String>,
+
+    /// Global domain blocklist shared by all URL-based network tools.
+    /// Supports exact, `*.example.com`, and `*`. Takes priority over allowlists.
+    #[serde(default)]
+    pub domain_blocklist: Vec<String>,
+
+    /// Persisted first-visit approvals granted by a human operator.
+    /// Supports exact, `*.example.com`, and `*`.
+    #[serde(default)]
+    pub approved_domains: Vec<String>,
+}
+
+impl Default for UrlAccessConfig {
+    fn default() -> Self {
+        Self {
+            block_private_ip: true,
+            allow_cidrs: Vec::new(),
+            allow_domains: Vec::new(),
+            allow_loopback: false,
+            require_first_visit_approval: false,
+            enforce_domain_allowlist: false,
+            domain_allowlist: Vec::new(),
+            domain_blocklist: Vec::new(),
+            approved_domains: Vec::new(),
+        }
+    }
 }
 
 /// OTP validation strategy.
@@ -4136,12 +4810,25 @@ pub enum OtpMethod {
     CliPrompt,
 }
 
+/// Channel delivery mode for OTP challenges.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtpChallengeDelivery {
+    /// Send OTP challenge in direct message/private channel.
+    #[default]
+    Dm,
+    /// Send OTP challenge in thread where supported.
+    Thread,
+    /// Send OTP challenge as ephemeral message where supported.
+    Ephemeral,
+}
+
 /// Security OTP configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OtpConfig {
-    /// Enable OTP gating. Defaults to disabled for backward compatibility.
-    #[serde(default)]
+    /// Enable OTP gating. Defaults to enabled.
+    #[serde(default = "default_otp_enabled")]
     pub enabled: bool,
 
     /// OTP method.
@@ -4167,6 +4854,58 @@ pub struct OtpConfig {
     /// Domain-category presets expanded into `gated_domains`.
     #[serde(default)]
     pub gated_domain_categories: Vec<String>,
+
+    /// Delivery mode for OTP challenge prompts in chat channels.
+    #[serde(default)]
+    pub challenge_delivery: OtpChallengeDelivery,
+
+    /// Maximum time a challenge remains valid, in seconds.
+    #[serde(default = "default_otp_challenge_timeout_secs")]
+    pub challenge_timeout_secs: u64,
+
+    /// Maximum OTP attempts allowed per challenge.
+    #[serde(default = "default_otp_challenge_max_attempts")]
+    pub challenge_max_attempts: u8,
+}
+
+/// Custom role definition for user-level authorization.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityRoleConfig {
+    /// Stable role name used by user records.
+    pub name: String,
+
+    /// Optional human-readable description.
+    #[serde(default)]
+    pub description: String,
+
+    /// Explicit allowlist of tools for this role.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+
+    /// Explicit denylist of tools for this role.
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+
+    /// Tool names requiring OTP for this role.
+    #[serde(default)]
+    pub totp_gated: Vec<String>,
+
+    /// Optional parent role name used for inheritance.
+    #[serde(default)]
+    pub inherits: Option<String>,
+
+    /// Role-scoped domain patterns requiring OTP.
+    #[serde(default)]
+    pub gated_domains: Vec<String>,
+
+    /// Role-scoped domain categories requiring OTP.
+    #[serde(default)]
+    pub gated_domain_categories: Vec<String>,
+}
+
+fn default_otp_enabled() -> bool {
+    true
 }
 
 fn default_otp_token_ttl_secs() -> u64 {
@@ -4175,6 +4914,14 @@ fn default_otp_token_ttl_secs() -> u64 {
 
 fn default_otp_cache_valid_secs() -> u64 {
     300
+}
+
+fn default_otp_challenge_timeout_secs() -> u64 {
+    120
+}
+
+fn default_otp_challenge_max_attempts() -> u8 {
+    3
 }
 
 fn default_otp_gated_actions() -> Vec<String> {
@@ -4190,13 +4937,16 @@ fn default_otp_gated_actions() -> Vec<String> {
 impl Default for OtpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_otp_enabled(),
             method: OtpMethod::Totp,
             token_ttl_secs: default_otp_token_ttl_secs(),
             cache_valid_secs: default_otp_cache_valid_secs(),
             gated_actions: default_otp_gated_actions(),
             gated_domains: Vec::new(),
             gated_domain_categories: Vec::new(),
+            challenge_delivery: OtpChallengeDelivery::Dm,
+            challenge_timeout_secs: default_otp_challenge_timeout_secs(),
+            challenge_max_attempts: default_otp_challenge_max_attempts(),
         }
     }
 }
@@ -4535,6 +5285,15 @@ pub enum QQReceiveMode {
     Webhook,
 }
 
+/// QQ API environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QQEnvironment {
+    #[default]
+    Production,
+    Sandbox,
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -4548,6 +5307,9 @@ pub struct QQConfig {
     /// Event receive mode: "webhook" (default) or "websocket".
     #[serde(default)]
     pub receive_mode: QQReceiveMode,
+    /// API environment: "production" (default) or "sandbox".
+    #[serde(default)]
+    pub environment: QQEnvironment,
 }
 
 impl ChannelConfig for QQConfig {
@@ -4638,15 +5400,19 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
+            economic: EconomicConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             coordination: CoordinationConfig::default(),
             hooks: HooksConfig::default(),
+            plugins: PluginsConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         }
     }
 }
@@ -5377,6 +6143,65 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for (i, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{i}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{i}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{i}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
@@ -5440,6 +6265,11 @@ impl Config {
             decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
             decrypt_optional_secret(
                 &store,
+                &mut config.transcription.api_key,
+                "config.transcription.api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
@@ -5469,6 +6299,21 @@ impl Config {
                 &store,
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.perplexity_api_key,
+                "config.web_search.perplexity_api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.exa_api_key,
+                "config.web_search.exa_api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.jina_api_key,
+                "config.web_search.jina_api_key",
             )?;
 
             decrypt_optional_secret(
@@ -5548,6 +6393,28 @@ impl Config {
         }
     }
 
+    fn normalize_provider_transport(raw: Option<&str>, source: &str) -> Option<String> {
+        let value = raw?.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+        match normalized.as_str() {
+            "auto" => Some("auto".to_string()),
+            "websocket" | "ws" => Some("websocket".to_string()),
+            "sse" | "http" => Some("sse".to_string()),
+            _ => {
+                tracing::warn!(
+                    transport = %value,
+                    source,
+                    "Ignoring invalid provider transport override"
+                );
+                None
+            }
+        }
+    }
+
     /// Resolve provider reasoning level with backward-compatible runtime alias.
     ///
     /// Priority:
@@ -5589,6 +6456,16 @@ impl Config {
             }
             (None, None) => None,
         }
+    }
+
+    /// Resolve provider transport mode (`provider.transport`).
+    ///
+    /// Supported values:
+    /// - `auto`
+    /// - `websocket`
+    /// - `sse`
+    pub fn effective_provider_transport(&self) -> Option<String> {
+        Self::normalize_provider_transport(self.provider.transport.as_deref(), "provider.transport")
     }
 
     fn lookup_model_provider_profile(
@@ -5729,6 +6606,12 @@ impl Config {
                 "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
             );
         }
+        if self.security.otp.challenge_timeout_secs == 0 {
+            anyhow::bail!("security.otp.challenge_timeout_secs must be greater than 0");
+        }
+        if self.security.otp.challenge_max_attempts == 0 {
+            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+        }
         for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
             let normalized = action.trim();
             if normalized.is_empty() {
@@ -5750,6 +6633,156 @@ impl Config {
         .with_context(|| {
             "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
         })?;
+        for (i, cidr) in self.security.url_access.allow_cidrs.iter().enumerate() {
+            parse_cidr_notation(cidr).with_context(|| {
+                format!("security.url_access.allow_cidrs[{i}] is invalid CIDR notation: {cidr}")
+            })?;
+        }
+        for (i, domain) in self.security.url_access.allow_domains.iter().enumerate() {
+            let normalized = domain.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not be empty");
+            }
+            if normalized.chars().any(char::is_whitespace) {
+                anyhow::bail!("security.url_access.allow_domains[{i}] must not contain whitespace");
+            }
+        }
+        for (i, domain) in self.security.url_access.domain_allowlist.iter().enumerate() {
+            let normalized = domain.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.url_access.domain_allowlist[{i}] must not be empty");
+            }
+            if normalized.chars().any(char::is_whitespace) {
+                anyhow::bail!(
+                    "security.url_access.domain_allowlist[{i}] must not contain whitespace"
+                );
+            }
+        }
+        for (i, domain) in self.security.url_access.domain_blocklist.iter().enumerate() {
+            let normalized = domain.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.url_access.domain_blocklist[{i}] must not be empty");
+            }
+            if normalized.chars().any(char::is_whitespace) {
+                anyhow::bail!(
+                    "security.url_access.domain_blocklist[{i}] must not contain whitespace"
+                );
+            }
+        }
+        for (i, domain) in self.security.url_access.approved_domains.iter().enumerate() {
+            let normalized = domain.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.url_access.approved_domains[{i}] must not be empty");
+            }
+            if normalized.chars().any(char::is_whitespace) {
+                anyhow::bail!(
+                    "security.url_access.approved_domains[{i}] must not contain whitespace"
+                );
+            }
+        }
+        if self.security.url_access.enforce_domain_allowlist
+            && self.security.url_access.domain_allowlist.is_empty()
+        {
+            anyhow::bail!(
+                "security.url_access.enforce_domain_allowlist=true requires non-empty security.url_access.domain_allowlist"
+            );
+        }
+        let built_in_roles = ["owner", "admin", "operator", "viewer", "guest"];
+        let mut custom_role_names = std::collections::HashSet::new();
+        for (i, role) in self.security.roles.iter().enumerate() {
+            let name = role.name.trim();
+            if name.is_empty() {
+                anyhow::bail!("security.roles[{i}].name must not be empty");
+            }
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!("security.roles[{i}].name contains invalid characters: {name}");
+            }
+            let normalized_name = name.to_ascii_lowercase();
+            if built_in_roles
+                .iter()
+                .any(|built_in| built_in == &normalized_name.as_str())
+            {
+                anyhow::bail!(
+                    "security.roles[{i}].name conflicts with built-in role: {normalized_name}"
+                );
+            }
+            if !custom_role_names.insert(normalized_name.clone()) {
+                anyhow::bail!("security.roles contains duplicate role: {normalized_name}");
+            }
+
+            for (tool_idx, tool_name) in role.allowed_tools.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "security.roles[{i}].allowed_tools[{tool_idx}] must not be empty"
+                    );
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].allowed_tools[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            for (tool_idx, tool_name) in role.denied_tools.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!("security.roles[{i}].denied_tools[{tool_idx}] must not be empty");
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].denied_tools[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            for (tool_idx, tool_name) in role.totp_gated.iter().enumerate() {
+                let normalized = tool_name.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!("security.roles[{i}].totp_gated[{tool_idx}] must not be empty");
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '*')
+                {
+                    anyhow::bail!(
+                        "security.roles[{i}].totp_gated[{tool_idx}] contains invalid characters: {normalized}"
+                    );
+                }
+            }
+            DomainMatcher::new(&role.gated_domains, &role.gated_domain_categories)
+                .with_context(|| format!("Invalid security.roles[{i}] domain settings"))?;
+            if let Some(parent) = role.inherits.as_deref() {
+                let normalized_parent = parent.trim().to_ascii_lowercase();
+                if normalized_parent.is_empty() {
+                    anyhow::bail!("security.roles[{i}].inherits must not be empty");
+                }
+                if normalized_parent == normalized_name {
+                    anyhow::bail!("security.roles[{i}].inherits must not reference itself");
+                }
+            }
+        }
+        for (i, role) in self.security.roles.iter().enumerate() {
+            if let Some(parent) = role.inherits.as_deref() {
+                let normalized_parent = parent.trim().to_ascii_lowercase();
+                let built_in_exists = built_in_roles
+                    .iter()
+                    .any(|built_in| built_in == &normalized_parent.as_str());
+                let custom_exists = custom_role_names.contains(&normalized_parent);
+                if !built_in_exists && !custom_exists {
+                    anyhow::bail!(
+                        "security.roles[{i}].inherits references unknown role: {normalized_parent}"
+                    );
+                }
+            }
+        }
         if self.security.estop.state_file.trim().is_empty() {
             anyhow::bail!("security.estop.state_file must not be empty");
         }
@@ -5799,6 +6832,79 @@ impl Config {
                 );
             }
         }
+        if self.security.perplexity_filter.perplexity_threshold <= 1.0 {
+            anyhow::bail!(
+                "security.perplexity_filter.perplexity_threshold must be greater than 1.0"
+            );
+        }
+        if self.security.perplexity_filter.suffix_window_chars < 8 {
+            anyhow::bail!("security.perplexity_filter.suffix_window_chars must be at least 8");
+        }
+        if self.security.perplexity_filter.min_prompt_chars < 8 {
+            anyhow::bail!("security.perplexity_filter.min_prompt_chars must be at least 8");
+        }
+        if !(0.0..=1.0).contains(&self.security.perplexity_filter.symbol_ratio_threshold) {
+            anyhow::bail!(
+                "security.perplexity_filter.symbol_ratio_threshold must be between 0.0 and 1.0"
+            );
+        }
+
+        // Browser
+        if normalize_browser_open_choice(&self.browser.browser_open).is_none() {
+            anyhow::bail!(
+                "browser.browser_open must be one of: {}",
+                BROWSER_OPEN_ALLOWED_VALUES.join(", ")
+            );
+        }
+        if normalize_browser_backend(&self.browser.backend).is_none() {
+            anyhow::bail!(
+                "browser.backend must be one of: {}",
+                BROWSER_BACKEND_ALLOWED_VALUES.join(", ")
+            );
+        }
+        for (i, backend) in self.browser.auto_backend_priority.iter().enumerate() {
+            if normalize_browser_auto_backend(backend).is_none() {
+                anyhow::bail!(
+                    "browser.auto_backend_priority[{i}] must be one of: {}",
+                    BROWSER_AUTO_BACKEND_ALLOWED_VALUES.join(", ")
+                );
+            }
+        }
+
+        // Web search
+        if normalize_web_search_provider(&self.web_search.provider).is_none() {
+            anyhow::bail!(
+                "web_search.provider must be one of: {}",
+                WEB_SEARCH_PROVIDER_ALLOWED_VALUES.join(", ")
+            );
+        }
+        for (i, provider) in self.web_search.fallback_providers.iter().enumerate() {
+            if normalize_web_search_provider(provider).is_none() {
+                anyhow::bail!(
+                    "web_search.fallback_providers[{i}] must be one of: {}",
+                    WEB_SEARCH_PROVIDER_ALLOWED_VALUES.join(", ")
+                );
+            }
+        }
+        let exa_search_type = self.web_search.exa_search_type.trim().to_ascii_lowercase();
+        if !WEB_SEARCH_EXA_SEARCH_TYPE_ALLOWED_VALUES.contains(&exa_search_type.as_str()) {
+            anyhow::bail!(
+                "web_search.exa_search_type must be one of: {}",
+                WEB_SEARCH_EXA_SEARCH_TYPE_ALLOWED_VALUES.join(", ")
+            );
+        }
+        if self.web_search.retries_per_provider > 5 {
+            anyhow::bail!("web_search.retries_per_provider must be between 0 and 5");
+        }
+        if self.web_search.retry_backoff_ms == 0 {
+            anyhow::bail!("web_search.retry_backoff_ms must be greater than 0");
+        }
+        if !(1..=10).contains(&self.web_search.max_results) {
+            anyhow::bail!("web_search.max_results must be between 1 and 10");
+        }
+        if self.web_search.timeout_secs == 0 {
+            anyhow::bail!("web_search.timeout_secs must be greater than 0");
+        }
 
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
@@ -5822,6 +6928,32 @@ impl Config {
             if route.max_tokens == Some(0) {
                 anyhow::bail!("model_routes[{i}].max_tokens must be greater than 0");
             }
+            if route
+                .transport
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && Self::normalize_provider_transport(
+                    route.transport.as_deref(),
+                    "model_routes[].transport",
+                )
+                .is_none()
+            {
+                anyhow::bail!("model_routes[{i}].transport must be one of: auto, websocket, sse");
+            }
+        }
+
+        if self
+            .provider
+            .transport
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && Self::normalize_provider_transport(
+                self.provider.transport.as_deref(),
+                "provider.transport",
+            )
+            .is_none()
+        {
+            anyhow::bail!("provider.transport must be one of: auto, websocket, sse");
         }
 
         if self.provider_api.is_some()
@@ -5916,6 +7048,11 @@ impl Config {
             }
         }
 
+        // MCP
+        if self.mcp.enabled {
+            validate_mcp_config(&self.mcp)?;
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -5934,6 +7071,34 @@ impl Config {
         }
         if self.coordination.max_seen_message_ids == 0 {
             anyhow::bail!("coordination.max_seen_message_ids must be greater than 0");
+        }
+
+        // WASM config
+        if self.wasm.memory_limit_mb == 0 || self.wasm.memory_limit_mb > 256 {
+            anyhow::bail!(
+                "wasm.memory_limit_mb must be between 1 and 256, got {}",
+                self.wasm.memory_limit_mb
+            );
+        }
+        if self.wasm.fuel_limit == 0 {
+            anyhow::bail!("wasm.fuel_limit must be greater than 0");
+        }
+        {
+            let url = &self.wasm.registry_url;
+            // Extract what comes after "https://" and check that the host part
+            // (up to the first '/', '?', '#', or ':') is non-empty.
+            let has_valid_host = url
+                .strip_prefix("https://")
+                .map(|rest| {
+                    let host = rest.split(&['/', '?', '#', ':'][..]).next().unwrap_or("");
+                    !host.is_empty()
+                })
+                .unwrap_or(false);
+            if !has_valid_host {
+                anyhow::bail!(
+                    "wasm.registry_url must be a valid HTTPS URL with a non-empty host, got '{url}'"
+                );
+            }
         }
 
         Ok(())
@@ -6029,6 +7194,19 @@ impl Config {
             }
         }
 
+        // Skills script-file audit override: ZEROCLAW_SKILLS_ALLOW_SCRIPTS
+        if let Ok(flag) = std::env::var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS") {
+            if !flag.trim().is_empty() {
+                match flag.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.skills.allow_scripts = true,
+                    "0" | "false" | "no" | "off" => self.skills.allow_scripts = false,
+                    _ => tracing::warn!(
+                        "Ignoring invalid ZEROCLAW_SKILLS_ALLOW_SCRIPTS (valid: 1|0|true|false|yes|no|on|off)"
+                    ),
+                }
+            }
+        }
+
         // Skills prompt mode override: ZEROCLAW_SKILLS_PROMPT_MODE
         if let Ok(mode) = std::env::var("ZEROCLAW_SKILLS_PROMPT_MODE") {
             if !mode.trim().is_empty() {
@@ -6107,6 +7285,17 @@ impl Config {
             }
         }
 
+        // Provider transport override: ZEROCLAW_PROVIDER_TRANSPORT or PROVIDER_TRANSPORT
+        if let Ok(transport) = std::env::var("ZEROCLAW_PROVIDER_TRANSPORT")
+            .or_else(|_| std::env::var("PROVIDER_TRANSPORT"))
+        {
+            if let Some(normalized) =
+                Self::normalize_provider_transport(Some(&transport), "env:provider_transport")
+            {
+                self.provider.transport = Some(normalized);
+            }
+        }
+
         // Vision support override: ZEROCLAW_MODEL_SUPPORT_VISION or MODEL_SUPPORT_VISION
         if let Ok(flag) = std::env::var("ZEROCLAW_MODEL_SUPPORT_VISION")
             .or_else(|_| std::env::var("MODEL_SUPPORT_VISION"))
@@ -6146,6 +7335,36 @@ impl Config {
             }
         }
 
+        // Perplexity API key: ZEROCLAW_PERPLEXITY_API_KEY or PERPLEXITY_API_KEY
+        if let Ok(api_key) = std::env::var("ZEROCLAW_PERPLEXITY_API_KEY")
+            .or_else(|_| std::env::var("PERPLEXITY_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.perplexity_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Exa API key: ZEROCLAW_EXA_API_KEY or EXA_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_EXA_API_KEY").or_else(|_| std::env::var("EXA_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.exa_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Jina API key: ZEROCLAW_JINA_API_KEY or JINA_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_JINA_API_KEY").or_else(|_| std::env::var("JINA_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.jina_api_key = Some(api_key.to_string());
+            }
+        }
+
         // Web search max results: ZEROCLAW_WEB_SEARCH_MAX_RESULTS or WEB_SEARCH_MAX_RESULTS
         if let Ok(max_results) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_RESULTS")
             .or_else(|_| std::env::var("WEB_SEARCH_MAX_RESULTS"))
@@ -6157,6 +7376,138 @@ impl Config {
             }
         }
 
+        // Web search fallback providers (comma-separated)
+        if let Ok(fallbacks) = std::env::var("ZEROCLAW_WEB_SEARCH_FALLBACK_PROVIDERS")
+            .or_else(|_| std::env::var("WEB_SEARCH_FALLBACK_PROVIDERS"))
+        {
+            self.web_search.fallback_providers = fallbacks
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        // Web search retries per provider
+        if let Ok(retries) = std::env::var("ZEROCLAW_WEB_SEARCH_RETRIES_PER_PROVIDER")
+            .or_else(|_| std::env::var("WEB_SEARCH_RETRIES_PER_PROVIDER"))
+        {
+            if let Ok(retries) = retries.parse::<u32>() {
+                self.web_search.retries_per_provider = retries;
+            }
+        }
+
+        // Web search retry backoff (ms)
+        if let Ok(backoff_ms) = std::env::var("ZEROCLAW_WEB_SEARCH_RETRY_BACKOFF_MS")
+            .or_else(|_| std::env::var("WEB_SEARCH_RETRY_BACKOFF_MS"))
+        {
+            if let Ok(backoff_ms) = backoff_ms.parse::<u64>() {
+                if backoff_ms > 0 {
+                    self.web_search.retry_backoff_ms = backoff_ms;
+                }
+            }
+        }
+
+        // Web search domain filter
+        if let Ok(filters) = std::env::var("ZEROCLAW_WEB_SEARCH_DOMAIN_FILTER")
+            .or_else(|_| std::env::var("WEB_SEARCH_DOMAIN_FILTER"))
+        {
+            self.web_search.domain_filter = filters
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        // Web search language filter
+        if let Ok(filters) = std::env::var("ZEROCLAW_WEB_SEARCH_LANGUAGE_FILTER")
+            .or_else(|_| std::env::var("WEB_SEARCH_LANGUAGE_FILTER"))
+        {
+            self.web_search.language_filter = filters
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        // Web search country
+        if let Ok(country) = std::env::var("ZEROCLAW_WEB_SEARCH_COUNTRY")
+            .or_else(|_| std::env::var("WEB_SEARCH_COUNTRY"))
+        {
+            let country = country.trim();
+            self.web_search.country = if country.is_empty() {
+                None
+            } else {
+                Some(country.to_string())
+            };
+        }
+
+        // Web search recency filter
+        if let Ok(recency_filter) = std::env::var("ZEROCLAW_WEB_SEARCH_RECENCY_FILTER")
+            .or_else(|_| std::env::var("WEB_SEARCH_RECENCY_FILTER"))
+        {
+            let recency_filter = recency_filter.trim();
+            self.web_search.recency_filter = if recency_filter.is_empty() {
+                None
+            } else {
+                Some(recency_filter.to_string())
+            };
+        }
+
+        // Web search max tokens
+        if let Ok(max_tokens) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_TOKENS")
+            .or_else(|_| std::env::var("WEB_SEARCH_MAX_TOKENS"))
+        {
+            if let Ok(max_tokens) = max_tokens.parse::<u32>() {
+                if max_tokens > 0 {
+                    self.web_search.max_tokens = Some(max_tokens);
+                }
+            }
+        }
+
+        // Web search max tokens per page
+        if let Ok(max_tokens_per_page) = std::env::var("ZEROCLAW_WEB_SEARCH_MAX_TOKENS_PER_PAGE")
+            .or_else(|_| std::env::var("WEB_SEARCH_MAX_TOKENS_PER_PAGE"))
+        {
+            if let Ok(max_tokens_per_page) = max_tokens_per_page.parse::<u32>() {
+                if max_tokens_per_page > 0 {
+                    self.web_search.max_tokens_per_page = Some(max_tokens_per_page);
+                }
+            }
+        }
+
+        // Exa search type
+        if let Ok(search_type) = std::env::var("ZEROCLAW_WEB_SEARCH_EXA_SEARCH_TYPE")
+            .or_else(|_| std::env::var("WEB_SEARCH_EXA_SEARCH_TYPE"))
+        {
+            let search_type = search_type.trim();
+            if !search_type.is_empty() {
+                self.web_search.exa_search_type = search_type.to_string();
+            }
+        }
+
+        // Exa include text
+        if let Ok(include_text) = std::env::var("ZEROCLAW_WEB_SEARCH_EXA_INCLUDE_TEXT")
+            .or_else(|_| std::env::var("WEB_SEARCH_EXA_INCLUDE_TEXT"))
+        {
+            self.web_search.exa_include_text =
+                include_text == "1" || include_text.eq_ignore_ascii_case("true");
+        }
+
+        // Jina site filters
+        if let Ok(filters) = std::env::var("ZEROCLAW_WEB_SEARCH_JINA_SITE_FILTERS")
+            .or_else(|_| std::env::var("WEB_SEARCH_JINA_SITE_FILTERS"))
+        {
+            self.web_search.jina_site_filters = filters
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
         // Web search timeout: ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS or WEB_SEARCH_TIMEOUT_SECS
         if let Ok(timeout_secs) = std::env::var("ZEROCLAW_WEB_SEARCH_TIMEOUT_SECS")
             .or_else(|_| std::env::var("WEB_SEARCH_TIMEOUT_SECS"))
@@ -6166,6 +7517,114 @@ impl Config {
                     self.web_search.timeout_secs = timeout_secs;
                 }
             }
+        }
+
+        // Shared URL-access policy toggles and lists
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_BLOCK_PRIVATE_IP")
+            .or_else(|_| std::env::var("URL_ACCESS_BLOCK_PRIVATE_IP"))
+        {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => self.security.url_access.block_private_ip = true,
+                "0" | "false" | "no" | "off" => self.security.url_access.block_private_ip = false,
+                _ => {}
+            }
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_ALLOW_LOOPBACK")
+            .or_else(|_| std::env::var("URL_ACCESS_ALLOW_LOOPBACK"))
+        {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => self.security.url_access.allow_loopback = true,
+                "0" | "false" | "no" | "off" => self.security.url_access.allow_loopback = false,
+                _ => {}
+            }
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_REQUIRE_FIRST_VISIT_APPROVAL")
+            .or_else(|_| std::env::var("URL_ACCESS_REQUIRE_FIRST_VISIT_APPROVAL"))
+        {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => {
+                    self.security.url_access.require_first_visit_approval = true
+                }
+                "0" | "false" | "no" | "off" => {
+                    self.security.url_access.require_first_visit_approval = false
+                }
+                _ => {}
+            }
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_ENFORCE_DOMAIN_ALLOWLIST")
+            .or_else(|_| std::env::var("URL_ACCESS_ENFORCE_DOMAIN_ALLOWLIST"))
+        {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => {
+                    self.security.url_access.enforce_domain_allowlist = true
+                }
+                "0" | "false" | "no" | "off" => {
+                    self.security.url_access.enforce_domain_allowlist = false
+                }
+                _ => {}
+            }
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_ALLOW_CIDRS")
+            .or_else(|_| std::env::var("URL_ACCESS_ALLOW_CIDRS"))
+        {
+            self.security.url_access.allow_cidrs = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_ALLOW_DOMAINS")
+            .or_else(|_| std::env::var("URL_ACCESS_ALLOW_DOMAINS"))
+        {
+            self.security.url_access.allow_domains = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_DOMAIN_ALLOWLIST")
+            .or_else(|_| std::env::var("URL_ACCESS_DOMAIN_ALLOWLIST"))
+        {
+            self.security.url_access.domain_allowlist = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_DOMAIN_BLOCKLIST")
+            .or_else(|_| std::env::var("URL_ACCESS_DOMAIN_BLOCKLIST"))
+        {
+            self.security.url_access.domain_blocklist = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        if let Ok(value) = std::env::var("ZEROCLAW_URL_ACCESS_APPROVED_DOMAINS")
+            .or_else(|_| std::env::var("URL_ACCESS_APPROVED_DOMAINS"))
+        {
+            self.security.url_access.approved_domains = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
         }
 
         // Storage provider key (optional backend override): ZEROCLAW_STORAGE_PROVIDER
@@ -6274,6 +7733,11 @@ impl Config {
         encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
         encrypt_optional_secret(
             &store,
+            &mut config_to_save.transcription.api_key,
+            "config.transcription.api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
             &mut config_to_save.composio.api_key,
             "config.composio.api_key",
         )?;
@@ -6303,6 +7767,21 @@ impl Config {
             &store,
             &mut config_to_save.web_search.brave_api_key,
             "config.web_search.brave_api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.perplexity_api_key,
+            "config.web_search.perplexity_api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.exa_api_key,
+            "config.web_search.exa_api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.jina_api_key,
+            "config.web_search.jina_api_key",
         )?;
 
         encrypt_optional_secret(
@@ -6478,12 +7957,66 @@ mod tests {
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
         assert!(!c.skills.open_skills_enabled);
+        assert!(!c.skills.allow_scripts);
         assert_eq!(
             c.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         );
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn wasm_config_default_has_correct_values() {
+        let cfg = WasmConfig::default();
+        assert!(cfg.enabled, "WASM tools should be enabled by default");
+        assert_eq!(cfg.memory_limit_mb, 64);
+        assert_eq!(cfg.fuel_limit, 1_000_000_000);
+        assert_eq!(cfg.registry_url, "https://zeromarket.vercel.app/api");
+    }
+
+    #[test]
+    async fn wasm_config_invalid_values_rejected() {
+        let mut c = Config::default();
+
+        // memory_limit_mb = 0
+        c.wasm.memory_limit_mb = 0;
+        assert!(c.validate().is_err(), "memory_limit_mb=0 should fail");
+
+        // memory_limit_mb = 257
+        c.wasm = WasmConfig::default();
+        c.wasm.memory_limit_mb = 257;
+        assert!(c.validate().is_err(), "memory_limit_mb=257 should fail");
+
+        // fuel_limit = 0
+        c.wasm = WasmConfig::default();
+        c.wasm.fuel_limit = 0;
+        assert!(c.validate().is_err(), "fuel_limit=0 should fail");
+
+        // empty registry_url
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = String::new();
+        assert!(c.validate().is_err(), "empty registry_url should fail");
+
+        // http:// instead of https://
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "http://example.com".to_string();
+        assert!(c.validate().is_err(), "http registry_url should fail");
+
+        // bare "https://"
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://".to_string();
+        assert!(c.validate().is_err(), "https:// without host should fail");
+
+        // port-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://:443".to_string();
+        assert!(c.validate().is_err(), "https://:443 should fail");
+
+        // query-only, no hostname
+        c.wasm = WasmConfig::default();
+        c.wasm.registry_url = "https://?q=1".to_string();
+        assert!(c.validate().is_err(), "https://?q=1 should fail");
     }
 
     #[test]
@@ -6835,6 +8368,7 @@ default_temperature = 0.7
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            plugins: PluginsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -6895,13 +8429,16 @@ default_temperature = 0.7
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
+            economic: EconomicConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -7175,7 +8712,7 @@ reasoning_level = "high"
     #[test]
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
-        assert!(!cfg.compact_context);
+        assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 20);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
@@ -7241,6 +8778,7 @@ tool_dispatcher = "xml"
             scheduler: SchedulerConfig::default(),
             coordination: CoordinationConfig::default(),
             skills: SkillsConfig::default(),
+            plugins: PluginsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -7263,13 +8801,16 @@ tool_dispatcher = "xml"
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
+            economic: EconomicConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
             model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -7302,12 +8843,16 @@ tool_dispatcher = "xml"
         config.workspace_dir = dir.join("workspace");
         config.config_path = dir.join("config.toml");
         config.api_key = Some("root-credential".into());
+        config.transcription.api_key = Some("transcription-credential".into());
         config.composio.api_key = Some("composio-credential".into());
         config.proxy.http_proxy = Some("http://user:pass@proxy.internal:8080".into());
         config.proxy.https_proxy = Some("https://user:pass@proxy.internal:8443".into());
         config.proxy.all_proxy = Some("socks5://user:pass@proxy.internal:1080".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
+        config.web_search.perplexity_api_key = Some("perplexity-credential".into());
+        config.web_search.exa_api_key = Some("exa-credential".into());
+        config.web_search.jina_api_key = Some("jina-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.reliability.api_keys = vec!["backup-credential".into()];
         config.gateway.paired_tokens = vec!["zc_0123456789abcdef".into()];
@@ -7348,6 +8893,15 @@ tool_dispatcher = "xml"
         let root_encrypted = stored.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(root_encrypted));
         assert_eq!(store.decrypt(root_encrypted).unwrap(), "root-credential");
+
+        let transcription_encrypted = stored.transcription.api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            transcription_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(transcription_encrypted).unwrap(),
+            "transcription-credential"
+        );
 
         let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
         assert!(crate::security::SecretStore::is_encrypted(
@@ -7400,6 +8954,20 @@ tool_dispatcher = "xml"
             store.decrypt(web_search_encrypted).unwrap(),
             "brave-credential"
         );
+        let perplexity_encrypted = stored.web_search.perplexity_api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(
+            perplexity_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(perplexity_encrypted).unwrap(),
+            "perplexity-credential"
+        );
+        let exa_encrypted = stored.web_search.exa_api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(exa_encrypted));
+        assert_eq!(store.decrypt(exa_encrypted).unwrap(), "exa-credential");
+        let jina_encrypted = stored.web_search.jina_api_key.as_deref().unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(jina_encrypted));
+        assert_eq!(store.decrypt(jina_encrypted).unwrap(), "jina-credential");
 
         let worker = stored.agents.get("worker").unwrap();
         let worker_encrypted = worker.api_key.as_deref().unwrap();
@@ -8312,6 +9880,10 @@ default_temperature = 0.7
         assert!(!b.enabled);
         assert!(b.allowed_domains.is_empty());
         assert_eq!(b.backend, "agent_browser");
+        assert!(b.auto_backend_priority.is_empty());
+        assert_eq!(b.agent_browser_command, "agent-browser");
+        assert!(b.agent_browser_extra_args.is_empty());
+        assert_eq!(b.agent_browser_timeout_ms, 30_000);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
         assert!(b.native_chrome_path.is_none());
@@ -8328,8 +9900,13 @@ default_temperature = 0.7
         let b = BrowserConfig {
             enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
+            browser_open: "chrome".into(),
             session_name: None,
             backend: "auto".into(),
+            auto_backend_priority: vec!["rust_native".into(), "agent_browser".into()],
+            agent_browser_command: "/usr/local/bin/agent-browser".into(),
+            agent_browser_extra_args: vec!["--sandbox".into(), "--trace".into()],
+            agent_browser_timeout_ms: 45_000,
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
             native_chrome_path: Some("/usr/bin/chromium".into()),
@@ -8349,6 +9926,16 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(
+            parsed.auto_backend_priority,
+            vec!["rust_native".to_string(), "agent_browser".to_string()]
+        );
+        assert_eq!(parsed.agent_browser_command, "/usr/local/bin/agent-browser");
+        assert_eq!(
+            parsed.agent_browser_extra_args,
+            vec!["--sandbox".to_string(), "--trace".to_string()]
+        );
+        assert_eq!(parsed.agent_browser_timeout_ms, 45_000);
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
         assert_eq!(
@@ -8377,6 +9964,130 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+    }
+
+    #[test]
+    async fn web_search_config_default_extended_fields() {
+        let ws = WebSearchConfig::default();
+        assert_eq!(ws.provider, "duckduckgo");
+        assert!(ws.fallback_providers.is_empty());
+        assert_eq!(ws.retries_per_provider, 0);
+        assert_eq!(ws.retry_backoff_ms, 250);
+        assert!(ws.domain_filter.is_empty());
+        assert!(ws.language_filter.is_empty());
+        assert!(ws.country.is_none());
+        assert!(ws.recency_filter.is_none());
+        assert!(ws.max_tokens.is_none());
+        assert!(ws.max_tokens_per_page.is_none());
+        assert_eq!(ws.exa_search_type, "auto");
+        assert!(!ws.exa_include_text);
+        assert!(ws.jina_site_filters.is_empty());
+    }
+
+    #[test]
+    async fn config_validate_rejects_unknown_browser_open_value() {
+        let mut config = Config::default();
+        config.browser.browser_open = "safari".into();
+
+        let error = config
+            .validate()
+            .expect_err("expected browser.browser_open validation failure");
+        assert!(error.to_string().contains("browser.browser_open"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_unknown_browser_backend_value() {
+        let mut config = Config::default();
+        config.browser.backend = "playwright".into();
+
+        let error = config
+            .validate()
+            .expect_err("expected browser.backend validation failure");
+        assert!(error.to_string().contains("browser.backend"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_auto_backend_priority_value() {
+        let mut config = Config::default();
+        config.browser.backend = "auto".into();
+        config.browser.auto_backend_priority = vec!["auto".into()];
+
+        let error = config
+            .validate()
+            .expect_err("expected browser.auto_backend_priority validation failure");
+        assert!(error
+            .to_string()
+            .contains("browser.auto_backend_priority[0]"));
+    }
+
+    #[test]
+    async fn config_validate_accepts_web_search_ddg_alias() {
+        let mut config = Config::default();
+        config.web_search.provider = "ddg".into();
+        config.web_search.fallback_providers = vec!["jina".into()];
+
+        config
+            .validate()
+            .expect("ddg alias should be accepted for web_search.provider");
+    }
+
+    #[test]
+    async fn config_validate_rejects_unknown_web_search_provider() {
+        let mut config = Config::default();
+        config.web_search.provider = "serpapi".into();
+
+        let error = config
+            .validate()
+            .expect_err("expected web_search.provider validation failure");
+        assert!(error.to_string().contains("web_search.provider"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_unknown_web_search_fallback_provider() {
+        let mut config = Config::default();
+        config.web_search.fallback_providers = vec!["serpapi".into()];
+
+        let error = config
+            .validate()
+            .expect_err("expected web_search.fallback_providers validation failure");
+        assert!(error
+            .to_string()
+            .contains("web_search.fallback_providers[0]"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_web_search_exa_search_type() {
+        let mut config = Config::default();
+        config.web_search.exa_search_type = "semantic".into();
+
+        let error = config
+            .validate()
+            .expect_err("expected web_search.exa_search_type validation failure");
+        assert!(error.to_string().contains("web_search.exa_search_type"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_web_search_out_of_range_values() {
+        let mut config = Config::default();
+        config.web_search.max_results = 11;
+
+        let error = config
+            .validate()
+            .expect_err("expected web_search.max_results validation failure");
+        assert!(error.to_string().contains("web_search.max_results"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_web_search_excessive_retries() {
+        let mut config = Config::default();
+        config.web_search.retries_per_provider = 6;
+
+        let error = config
+            .validate()
+            .expect_err("expected web_search.retries_per_provider validation failure");
+        assert!(error
+            .to_string()
+            .contains("web_search.retries_per_provider"));
     }
 
     // ── Environment variable overrides (Docker support) ─────────
@@ -8489,6 +10200,7 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         assert!(!config.skills.open_skills_enabled);
+        assert!(!config.skills.allow_scripts);
         assert!(config.skills.open_skills_dir.is_none());
         assert_eq!(
             config.skills.prompt_injection_mode,
@@ -8497,10 +10209,12 @@ requires_openai_auth = true
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "true");
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_DIR", "/tmp/open-skills");
+        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "yes");
         std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "compact");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert!(config.skills.allow_scripts);
         assert_eq!(
             config.skills.open_skills_dir.as_deref(),
             Some("/tmp/open-skills")
@@ -8512,6 +10226,7 @@ requires_openai_auth = true
 
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_DIR");
+        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
         std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
@@ -8520,18 +10235,22 @@ requires_openai_auth = true
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
         config.skills.open_skills_enabled = true;
+        config.skills.allow_scripts = true;
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
 
         std::env::set_var("ZEROCLAW_OPEN_SKILLS_ENABLED", "maybe");
+        std::env::set_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS", "maybe");
         std::env::set_var("ZEROCLAW_SKILLS_PROMPT_MODE", "invalid");
         config.apply_env_overrides();
 
         assert!(config.skills.open_skills_enabled);
+        assert!(config.skills.allow_scripts);
         assert_eq!(
             config.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Compact
         );
         std::env::remove_var("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        std::env::remove_var("ZEROCLAW_SKILLS_ALLOW_SCRIPTS");
         std::env::remove_var("ZEROCLAW_SKILLS_PROMPT_MODE");
     }
 
@@ -8622,6 +10341,7 @@ provider_api = "not-a-real-mode"
             model: "anthropic/claude-sonnet-4.6".to_string(),
             max_tokens: Some(0),
             api_key: None,
+            transport: None,
         }];
 
         let err = config
@@ -8630,6 +10350,48 @@ provider_api = "not-a-real-mode"
         assert!(err
             .to_string()
             .contains("model_routes[0].max_tokens must be greater than 0"));
+    }
+
+    #[test]
+    async fn provider_transport_normalizes_aliases() {
+        let mut config = Config::default();
+        config.provider.transport = Some("WS".to_string());
+        assert_eq!(
+            config.effective_provider_transport().as_deref(),
+            Some("websocket")
+        );
+    }
+
+    #[test]
+    async fn provider_transport_invalid_is_rejected() {
+        let mut config = Config::default();
+        config.provider.transport = Some("udp".to_string());
+        let err = config
+            .validate()
+            .expect_err("provider.transport should reject invalid values");
+        assert!(err
+            .to_string()
+            .contains("provider.transport must be one of: auto, websocket, sse"));
+    }
+
+    #[test]
+    async fn model_route_transport_invalid_is_rejected() {
+        let mut config = Config::default();
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "reasoning".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4.6".to_string(),
+            max_tokens: None,
+            api_key: None,
+            transport: Some("udp".to_string()),
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("model_routes[].transport should reject invalid values");
+        assert!(err
+            .to_string()
+            .contains("model_routes[0].transport must be one of: auto, websocket, sse"));
     }
 
     #[test]
@@ -9273,6 +11035,60 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn env_override_provider_transport_normalizes_zeroclaw_alias() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+        std::env::set_var("ZEROCLAW_PROVIDER_TRANSPORT", "WS");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("websocket"));
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+    }
+
+    #[test]
+    async fn env_override_provider_transport_normalizes_legacy_alias() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+        std::env::set_var("PROVIDER_TRANSPORT", "HTTP");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("sse"));
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+    }
+
+    #[test]
+    async fn env_override_provider_transport_invalid_zeroclaw_does_not_override_existing() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.provider.transport = Some("sse".to_string());
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+        std::env::set_var("ZEROCLAW_PROVIDER_TRANSPORT", "udp");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("sse"));
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+    }
+
+    #[test]
+    async fn env_override_provider_transport_invalid_legacy_does_not_override_existing() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.provider.transport = Some("auto".to_string());
+
+        std::env::remove_var("ZEROCLAW_PROVIDER_TRANSPORT");
+        std::env::set_var("PROVIDER_TRANSPORT", "udp");
+        config.apply_env_overrides();
+        assert_eq!(config.provider.transport.as_deref(), Some("auto"));
+
+        std::env::remove_var("PROVIDER_TRANSPORT");
+    }
+
+    #[test]
     async fn env_override_model_support_vision() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -9316,7 +11132,22 @@ default_model = "legacy-model"
         std::env::set_var("WEB_SEARCH_PROVIDER", "brave");
         std::env::set_var("WEB_SEARCH_MAX_RESULTS", "7");
         std::env::set_var("WEB_SEARCH_TIMEOUT_SECS", "20");
+        std::env::set_var("WEB_SEARCH_FALLBACK_PROVIDERS", "tavily,firecrawl");
+        std::env::set_var("WEB_SEARCH_RETRIES_PER_PROVIDER", "2");
+        std::env::set_var("WEB_SEARCH_RETRY_BACKOFF_MS", "400");
+        std::env::set_var("WEB_SEARCH_DOMAIN_FILTER", "docs.rs,github.com");
+        std::env::set_var("WEB_SEARCH_LANGUAGE_FILTER", "en,zh");
+        std::env::set_var("WEB_SEARCH_COUNTRY", "US");
+        std::env::set_var("WEB_SEARCH_RECENCY_FILTER", "day");
+        std::env::set_var("WEB_SEARCH_MAX_TOKENS", "4096");
+        std::env::set_var("WEB_SEARCH_MAX_TOKENS_PER_PAGE", "1024");
+        std::env::set_var("WEB_SEARCH_EXA_SEARCH_TYPE", "neural");
+        std::env::set_var("WEB_SEARCH_EXA_INCLUDE_TEXT", "true");
+        std::env::set_var("WEB_SEARCH_JINA_SITE_FILTERS", "arxiv.org,openai.com");
         std::env::set_var("BRAVE_API_KEY", "brave-test-key");
+        std::env::set_var("PERPLEXITY_API_KEY", "perplexity-test-key");
+        std::env::set_var("EXA_API_KEY", "exa-test-key");
+        std::env::set_var("JINA_API_KEY", "jina-test-key");
 
         config.apply_env_overrides();
 
@@ -9325,15 +11156,66 @@ default_model = "legacy-model"
         assert_eq!(config.web_search.max_results, 7);
         assert_eq!(config.web_search.timeout_secs, 20);
         assert_eq!(
+            config.web_search.fallback_providers,
+            vec!["tavily".to_string(), "firecrawl".to_string()]
+        );
+        assert_eq!(config.web_search.retries_per_provider, 2);
+        assert_eq!(config.web_search.retry_backoff_ms, 400);
+        assert_eq!(
+            config.web_search.domain_filter,
+            vec!["docs.rs".to_string(), "github.com".to_string()]
+        );
+        assert_eq!(
+            config.web_search.language_filter,
+            vec!["en".to_string(), "zh".to_string()]
+        );
+        assert_eq!(config.web_search.country.as_deref(), Some("US"));
+        assert_eq!(config.web_search.recency_filter.as_deref(), Some("day"));
+        assert_eq!(config.web_search.max_tokens, Some(4096));
+        assert_eq!(config.web_search.max_tokens_per_page, Some(1024));
+        assert_eq!(config.web_search.exa_search_type, "neural");
+        assert!(config.web_search.exa_include_text);
+        assert_eq!(
+            config.web_search.jina_site_filters,
+            vec!["arxiv.org".to_string(), "openai.com".to_string()]
+        );
+        assert_eq!(
             config.web_search.brave_api_key.as_deref(),
             Some("brave-test-key")
+        );
+        assert_eq!(
+            config.web_search.perplexity_api_key.as_deref(),
+            Some("perplexity-test-key")
+        );
+        assert_eq!(
+            config.web_search.exa_api_key.as_deref(),
+            Some("exa-test-key")
+        );
+        assert_eq!(
+            config.web_search.jina_api_key.as_deref(),
+            Some("jina-test-key")
         );
 
         std::env::remove_var("WEB_SEARCH_ENABLED");
         std::env::remove_var("WEB_SEARCH_PROVIDER");
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+        std::env::remove_var("WEB_SEARCH_FALLBACK_PROVIDERS");
+        std::env::remove_var("WEB_SEARCH_RETRIES_PER_PROVIDER");
+        std::env::remove_var("WEB_SEARCH_RETRY_BACKOFF_MS");
+        std::env::remove_var("WEB_SEARCH_DOMAIN_FILTER");
+        std::env::remove_var("WEB_SEARCH_LANGUAGE_FILTER");
+        std::env::remove_var("WEB_SEARCH_COUNTRY");
+        std::env::remove_var("WEB_SEARCH_RECENCY_FILTER");
+        std::env::remove_var("WEB_SEARCH_MAX_TOKENS");
+        std::env::remove_var("WEB_SEARCH_MAX_TOKENS_PER_PAGE");
+        std::env::remove_var("WEB_SEARCH_EXA_SEARCH_TYPE");
+        std::env::remove_var("WEB_SEARCH_EXA_INCLUDE_TEXT");
+        std::env::remove_var("WEB_SEARCH_JINA_SITE_FILTERS");
         std::env::remove_var("BRAVE_API_KEY");
+        std::env::remove_var("PERPLEXITY_API_KEY");
+        std::env::remove_var("EXA_API_KEY");
+        std::env::remove_var("JINA_API_KEY");
     }
 
     #[test]
@@ -9353,6 +11235,44 @@ default_model = "legacy-model"
 
         std::env::remove_var("WEB_SEARCH_MAX_RESULTS");
         std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS");
+    }
+
+    #[test]
+    async fn env_override_url_access_policy() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        std::env::set_var("URL_ACCESS_REQUIRE_FIRST_VISIT_APPROVAL", "true");
+        std::env::set_var("URL_ACCESS_ENFORCE_DOMAIN_ALLOWLIST", "1");
+        std::env::set_var("URL_ACCESS_DOMAIN_ALLOWLIST", "docs.rs,github.com");
+        std::env::set_var(
+            "URL_ACCESS_DOMAIN_BLOCKLIST",
+            "evil.example,*.tracking.local",
+        );
+        std::env::set_var("URL_ACCESS_APPROVED_DOMAINS", "rust-lang.org");
+
+        config.apply_env_overrides();
+
+        assert!(config.security.url_access.require_first_visit_approval);
+        assert!(config.security.url_access.enforce_domain_allowlist);
+        assert_eq!(
+            config.security.url_access.domain_allowlist,
+            vec!["docs.rs".to_string(), "github.com".to_string()]
+        );
+        assert_eq!(
+            config.security.url_access.domain_blocklist,
+            vec!["evil.example".to_string(), "*.tracking.local".to_string()]
+        );
+        assert_eq!(
+            config.security.url_access.approved_domains,
+            vec!["rust-lang.org".to_string()]
+        );
+
+        std::env::remove_var("URL_ACCESS_REQUIRE_FIRST_VISIT_APPROVAL");
+        std::env::remove_var("URL_ACCESS_ENFORCE_DOMAIN_ALLOWLIST");
+        std::env::remove_var("URL_ACCESS_DOMAIN_ALLOWLIST");
+        std::env::remove_var("URL_ACCESS_DOMAIN_BLOCKLIST");
+        std::env::remove_var("URL_ACCESS_APPROVED_DOMAINS");
     }
 
     #[test]
@@ -9746,6 +11666,7 @@ default_model = "legacy-model"
         let json = r#"{"app_id":"123","app_secret":"secret"}"#;
         let parsed: QQConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Webhook);
+        assert_eq!(parsed.environment, QQEnvironment::Production);
         assert!(parsed.allowed_users.is_empty());
     }
 
@@ -9756,11 +11677,53 @@ default_model = "legacy-model"
             app_secret: "secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: QQReceiveMode::Websocket,
+            environment: QQEnvironment::Sandbox,
         };
         let toml_str = toml::to_string(&qc).unwrap();
         let parsed: QQConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.receive_mode, QQReceiveMode::Websocket);
+        assert_eq!(parsed.environment, QQEnvironment::Sandbox);
         assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    #[test]
+    async fn dingtalk_config_defaults_allowed_users_to_empty() {
+        let json = r#"{"client_id":"ding-app-key","client_secret":"ding-app-secret"}"#;
+        let parsed: DingTalkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.client_id, "ding-app-key");
+        assert_eq!(parsed.client_secret, "ding-app-secret");
+        assert!(parsed.allowed_users.is_empty());
+    }
+
+    #[test]
+    async fn dingtalk_config_toml_roundtrip() {
+        let dc = DingTalkConfig {
+            client_id: "ding-app-key".into(),
+            client_secret: "ding-app-secret".into(),
+            allowed_users: vec!["*".into(), "staff123".into()],
+        };
+        let toml_str = toml::to_string(&dc).unwrap();
+        let parsed: DingTalkConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.client_id, "ding-app-key");
+        assert_eq!(parsed.client_secret, "ding-app-secret");
+        assert_eq!(parsed.allowed_users, vec!["*", "staff123"]);
+    }
+
+    #[test]
+    async fn channels_except_webhook_reports_dingtalk_as_enabled() {
+        let mut channels = ChannelsConfig::default();
+        channels.dingtalk = Some(DingTalkConfig {
+            client_id: "ding-app-key".into(),
+            client_secret: "ding-app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+
+        let dingtalk_state = channels
+            .channels_except_webhook()
+            .iter()
+            .find_map(|(handle, enabled)| (handle.name() == "DingTalk").then_some(*enabled));
+
+        assert_eq!(dingtalk_state, Some(true));
     }
 
     #[test]
@@ -9869,6 +11832,7 @@ default_model = "legacy-model"
     async fn transcription_config_defaults() {
         let tc = TranscriptionConfig::default();
         assert!(!tc.enabled);
+        assert!(tc.api_key.is_none());
         assert!(tc.api_url.contains("groq.com"));
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
@@ -9879,12 +11843,17 @@ default_model = "legacy-model"
     async fn config_roundtrip_with_transcription() {
         let mut config = Config::default();
         config.transcription.enabled = true;
+        config.transcription.api_key = Some("transcription-key".into());
         config.transcription.language = Some("en".into());
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
 
         assert!(parsed.transcription.enabled);
+        assert_eq!(
+            parsed.transcription.api_key.as_deref(),
+            Some("transcription-key")
+        );
         assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
         assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
     }
@@ -9912,13 +11881,30 @@ default_temperature = 0.7
         )
         .unwrap();
 
-        assert!(!parsed.security.otp.enabled);
+        assert!(parsed.security.otp.enabled);
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery,
+            OtpChallengeDelivery::Dm
+        );
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, 120);
+        assert_eq!(parsed.security.otp.challenge_max_attempts, 3);
+        assert!(parsed.security.roles.is_empty());
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
         assert!(parsed.security.syscall_anomaly.enabled);
         assert!(parsed.security.syscall_anomaly.alert_on_unknown_syscall);
         assert!(!parsed.security.syscall_anomaly.baseline_syscalls.is_empty());
+        assert!(parsed.security.url_access.block_private_ip);
+        assert!(parsed.security.url_access.allow_cidrs.is_empty());
+        assert!(parsed.security.url_access.allow_domains.is_empty());
+        assert!(!parsed.security.url_access.allow_loopback);
+        assert!(!parsed.security.url_access.require_first_visit_approval);
+        assert!(!parsed.security.url_access.enforce_domain_allowlist);
+        assert!(parsed.security.url_access.domain_allowlist.is_empty());
+        assert!(parsed.security.url_access.domain_blocklist.is_empty());
+        assert!(parsed.security.url_access.approved_domains.is_empty());
+        assert!(!parsed.security.perplexity_filter.enable_perplexity_filter);
     }
 
     #[test]
@@ -9937,6 +11923,19 @@ cache_valid_secs = 120
 gated_actions = ["shell", "browser_open"]
 gated_domains = ["*.chase.com", "accounts.google.com"]
 gated_domain_categories = ["banking"]
+challenge_delivery = "thread"
+challenge_timeout_secs = 180
+challenge_max_attempts = 4
+
+[[security.roles]]
+name = "developer"
+description = "Developer role"
+allowed_tools = ["shell", "file_read", "file_write"]
+denied_tools = ["memory_forget"]
+totp_gated = ["shell", "file_write"]
+inherits = "operator"
+gated_domains = ["*.chase.com"]
+gated_domain_categories = ["banking"]
 
 [security.estop]
 enabled = true
@@ -9953,6 +11952,13 @@ max_alerts_per_minute = 10
 alert_cooldown_secs = 15
 log_path = "syscall-anomalies.log"
 baseline_syscalls = ["read", "write", "openat", "close"]
+
+[security.perplexity_filter]
+enable_perplexity_filter = true
+perplexity_threshold = 16.5
+suffix_window_chars = 72
+min_prompt_chars = 40
+symbol_ratio_threshold = 0.25
 "#,
         )
         .unwrap();
@@ -9971,8 +11977,24 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert_eq!(parsed.security.syscall_anomaly.max_alerts_per_minute, 10);
         assert_eq!(parsed.security.syscall_anomaly.alert_cooldown_secs, 15);
         assert_eq!(parsed.security.syscall_anomaly.baseline_syscalls.len(), 4);
+        assert!(parsed.security.perplexity_filter.enable_perplexity_filter);
+        assert_eq!(parsed.security.perplexity_filter.perplexity_threshold, 16.5);
+        assert_eq!(parsed.security.perplexity_filter.suffix_window_chars, 72);
+        assert_eq!(parsed.security.perplexity_filter.min_prompt_chars, 40);
+        assert_eq!(
+            parsed.security.perplexity_filter.symbol_ratio_threshold,
+            0.25
+        );
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery,
+            OtpChallengeDelivery::Thread
+        );
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, 180);
+        assert_eq!(parsed.security.otp.challenge_max_attempts, 4);
+        assert_eq!(parsed.security.roles.len(), 1);
+        assert_eq!(parsed.security.roles[0].name, "developer");
         parsed.validate().unwrap();
     }
 
@@ -9983,6 +12005,74 @@ baseline_syscalls = ["read", "write", "openat", "close"]
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_url_access_cidr() {
+        let mut config = Config::default();
+        config.security.url_access.allow_cidrs = vec!["10.0.0.0".into()];
+        let err = config.validate().expect_err("expected invalid CIDR");
+        assert!(err.to_string().contains("security.url_access.allow_cidrs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_blank_url_access_domain() {
+        let mut config = Config::default();
+        config.security.url_access.allow_domains = vec!["   ".into()];
+        let err = config
+            .validate()
+            .expect_err("expected invalid URL allow domain");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.allow_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_blank_url_access_domain_allowlist_entry() {
+        let mut config = Config::default();
+        config.security.url_access.domain_allowlist = vec!["  ".into()];
+        let err = config
+            .validate()
+            .expect_err("expected invalid URL domain_allowlist entry");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.domain_allowlist"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_blank_url_access_domain_blocklist_entry() {
+        let mut config = Config::default();
+        config.security.url_access.domain_blocklist = vec!["  ".into()];
+        let err = config
+            .validate()
+            .expect_err("expected invalid URL domain_blocklist entry");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.domain_blocklist"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_blank_url_access_approved_domain_entry() {
+        let mut config = Config::default();
+        config.security.url_access.approved_domains = vec!["  ".into()];
+        let err = config
+            .validate()
+            .expect_err("expected invalid URL approved_domains entry");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.approved_domains"));
+    }
+
+    #[test]
+    async fn security_validation_requires_allowlist_when_enforcement_enabled() {
+        let mut config = Config::default();
+        config.security.url_access.enforce_domain_allowlist = true;
+        let err = config
+            .validate()
+            .expect_err("expected allowlist enforcement validation failure");
+        assert!(err
+            .to_string()
+            .contains("security.url_access.enforce_domain_allowlist"));
     }
 
     #[test]
@@ -10005,6 +12095,63 @@ baseline_syscalls = ["read", "write", "openat", "close"]
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_challenge_timeout() {
+        let mut config = Config::default();
+        config.security.otp.challenge_timeout_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected challenge timeout validation failure");
+        assert!(err.to_string().contains("challenge_timeout_secs"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_challenge_attempts() {
+        let mut config = Config::default();
+        config.security.otp.challenge_max_attempts = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected challenge attempts validation failure");
+        assert!(err.to_string().contains("challenge_max_attempts"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_unknown_role_parent() {
+        let mut config = Config::default();
+        config.security.roles = vec![SecurityRoleConfig {
+            name: "developer".to_string(),
+            inherits: Some("missing-parent".to_string()),
+            ..SecurityRoleConfig::default()
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("expected unknown role parent validation failure");
+        assert!(err.to_string().contains("inherits references unknown role"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_duplicate_role_name() {
+        let mut config = Config::default();
+        config.security.roles = vec![
+            SecurityRoleConfig {
+                name: "developer".to_string(),
+                ..SecurityRoleConfig::default()
+            },
+            SecurityRoleConfig {
+                name: "Developer".to_string(),
+                ..SecurityRoleConfig::default()
+            },
+        ];
+
+        let err = config
+            .validate()
+            .expect_err("expected duplicate role validation failure");
+        assert!(err.to_string().contains("duplicate role"));
     }
 
     #[test]
@@ -10064,6 +12211,28 @@ baseline_syscalls = ["read", "write", "openat", "close"]
         assert!(err
             .to_string()
             .contains("max_denied_events_per_minute must be less than or equal"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_perplexity_threshold() {
+        let mut config = Config::default();
+        config.security.perplexity_filter.perplexity_threshold = 1.0;
+
+        let err = config
+            .validate()
+            .expect_err("expected perplexity threshold validation failure");
+        assert!(err.to_string().contains("perplexity_threshold"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_perplexity_symbol_ratio_threshold() {
+        let mut config = Config::default();
+        config.security.perplexity_filter.symbol_ratio_threshold = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected perplexity symbol ratio validation failure");
+        assert!(err.to_string().contains("symbol_ratio_threshold"));
     }
 
     #[test]
