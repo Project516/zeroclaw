@@ -382,19 +382,21 @@ pub async fn render_memory_context(
     context
 }
 
-/// Strip a `render_memory_context` preamble off the front of `content`, if
-/// present. The preamble is provider-only per-turn context: it must never
-/// be persisted into durable/canonical history (trim write-back, session
-/// storage), only sent to the provider for the turn that recalled it.
-/// Returns `content` unchanged when no preamble is present.
-pub(crate) fn strip_memory_context_preamble(content: &str) -> &str {
-    let Some(after_open) = content.strip_prefix(MEMORY_CONTEXT_OPEN) else {
-        return content;
-    };
-    let Some(close_idx) = after_open.find(MEMORY_CONTEXT_CLOSE) else {
-        return content;
-    };
-    after_open[close_idx + MEMORY_CONTEXT_CLOSE.len()..].trim_start_matches('\n')
+/// Strip a `render_memory_context` preamble off the front of `content`.
+/// `preamble_len` is the exact byte length the injecting call recorded when
+/// it built this content (`run_tool_call_loop`'s `memory_preamble_len`
+/// out-param) — never inferred by matching `content` against the marker
+/// text, since a genuine user message can legitimately start with the same
+/// marker. `None`, or a length that doesn't land on a valid prefix of
+/// `content`, is a no-op: the preamble is provider-only per-turn context
+/// that must never be persisted into durable/canonical history (trim
+/// write-back, session storage), only sent to the provider for the turn
+/// that recalled it.
+pub(crate) fn strip_memory_context_preamble(content: &str, preamble_len: Option<usize>) -> &str {
+    match preamble_len {
+        Some(len) if len <= content.len() && content.is_char_boundary(len) => &content[len..],
+        _ => content,
+    }
 }
 
 #[cfg(test)]
@@ -1656,25 +1658,44 @@ mod tests {
     #[test]
     fn strip_memory_context_preamble_recovers_the_original_user_content() {
         let existing = "what's the weather like";
-        let with_preamble = format!(
-            "{MEMORY_CONTEXT_OPEN}\n- k: some recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n{existing}"
-        );
+        let preamble =
+            format!("{MEMORY_CONTEXT_OPEN}\n- k: some recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n");
+        let with_preamble = format!("{preamble}{existing}");
         assert_eq!(
-            strip_memory_context_preamble(&with_preamble),
+            strip_memory_context_preamble(&with_preamble, Some(preamble.len())),
             existing,
             "must recover exactly the pre-injection user content"
         );
     }
 
     #[test]
-    fn strip_memory_context_preamble_is_a_no_op_without_a_preamble() {
+    fn strip_memory_context_preamble_is_a_no_op_without_a_recorded_length() {
         let plain = "no memory preamble here";
-        assert_eq!(strip_memory_context_preamble(plain), plain);
+        assert_eq!(strip_memory_context_preamble(plain, None), plain);
 
-        // An open marker with no matching close is left untouched rather
-        // than silently swallowing the rest of the message.
-        let unterminated = format!("{MEMORY_CONTEXT_OPEN}\nunterminated");
-        assert_eq!(strip_memory_context_preamble(&unterminated), unterminated);
+        // A user message that happens to start with the marker text is left
+        // untouched when the caller never recorded injecting a preamble on
+        // it — provenance comes from the caller's own record, not the text.
+        let looks_like_a_preamble = format!(
+            "{MEMORY_CONTEXT_OPEN}\n- k: a user-authored fact\n{MEMORY_CONTEXT_CLOSE}\n\nplease keep this text"
+        );
+        assert_eq!(
+            strip_memory_context_preamble(&looks_like_a_preamble, None),
+            looks_like_a_preamble
+        );
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_ignores_a_length_past_content_or_off_a_char_boundary() {
+        let content = "short";
+        assert_eq!(
+            strip_memory_context_preamble(content, Some(content.len() + 1)),
+            content
+        );
+
+        // "é" is a 2-byte UTF-8 char; offset 1 lands mid-character.
+        let multibyte = "é ok";
+        assert_eq!(strip_memory_context_preamble(multibyte, Some(1)), multibyte);
     }
 
     /// Regression: a high-scoring but render-ineligible entry must not consume

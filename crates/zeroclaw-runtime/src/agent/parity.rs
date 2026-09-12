@@ -183,6 +183,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
         history: &mut history,
         // Test transcripts start fresh: no prior trim, no crumb.
         history_has_trim_breadcrumb: &mut false,
+        memory_preamble_len: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,

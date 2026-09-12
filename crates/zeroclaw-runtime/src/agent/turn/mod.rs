@@ -206,6 +206,15 @@ pub struct ToolLoop<'a> {
     /// locale changes for the runtime's lifetime. Trim paths write back any
     /// crumb they insert through this reference.
     pub history_has_trim_breadcrumb: &'a mut bool,
+    /// Out-param the loop writes through when it injects a recalled-memory
+    /// preamble onto the last user message for this turn's provider request
+    /// only: the exact byte length of the injected block. The caller uses
+    /// this recorded length, not marker text, to strip precisely the block
+    /// this turn injected before writing history back to durable storage —
+    /// a genuine user message that happens to start with the marker text is
+    /// never touched, because provenance comes from what the loop itself
+    /// recorded doing, the same principle as `history_has_trim_breadcrumb`.
+    pub memory_preamble_len: &'a mut Option<usize>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -917,6 +926,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         exec,
         history: raw_history,
         history_has_trim_breadcrumb,
+        memory_preamble_len,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -1038,6 +1048,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             if !context.is_empty() {
                 let existing = &turn_state.history[last_user_idx].content;
                 turn_state.history[last_user_idx].content = format!("{context}{existing}");
+                *memory_preamble_len = Some(context.len());
             }
         }
     }
@@ -3097,6 +3108,7 @@ async fn drive_live_sop_actions(
                                     ),
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
+                                    memory_preamble_len: &mut None,
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),

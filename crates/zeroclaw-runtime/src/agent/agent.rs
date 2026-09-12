@@ -2313,7 +2313,21 @@ impl Agent {
         self.model_name.clone()
     }
 
-    fn replay_loop_messages(loop_messages: &[ChatMessage]) -> Vec<ConversationMessage> {
+    fn replay_loop_messages(
+        loop_messages: &[ChatMessage],
+        memory_preamble_len: Option<usize>,
+    ) -> Vec<ConversationMessage> {
+        // The turn engine injects the recalled-memory preamble onto the last
+        // user message (`turn::mod.rs`'s `memory` handling, which records the
+        // exact byte length it injected) for this turn's provider request
+        // only; it must never land in durable/canonical history, which every
+        // call site of this function feeds. `strip_at` names the one message
+        // (by the same "last user message" rule the injector used) and the
+        // exact length to strip off it — never a marker-text match, so a
+        // genuine user message that starts with the same marker text is left
+        // untouched everywhere except the message this turn actually injected.
+        let strip_at = memory_preamble_len
+            .and_then(|len| Some((loop_messages.iter().rposition(|m| m.role == "user")?, len)));
         let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
         let push_tool_results = |replayed: &mut Vec<ConversationMessage>,
                                  results: Vec<ToolResultMessage>| {
@@ -2323,7 +2337,7 @@ impl Agent {
                 replayed.push(ConversationMessage::ToolResults(results));
             }
         };
-        for msg in loop_messages {
+        for (i, msg) in loop_messages.iter().enumerate() {
             if msg.role == "assistant"
                 && let Ok(serde_json::Value::Object(obj)) =
                     serde_json::from_str::<serde_json::Value>(&msg.content)
@@ -2412,13 +2426,14 @@ impl Agent {
                     continue;
                 }
             }
-            // The turn engine injects the recalled-memory preamble in place
-            // on the last user message (`turn::mod.rs`'s `memory` handling)
-            // for this turn's provider request only; it must never land in
-            // durable/canonical history, which every call site of this
-            // function feeds. Strip it before persisting — a no-op for any
-            // message that never carried the preamble.
-            let stripped = crate::agent::memory_inject::strip_memory_context_preamble(&msg.content);
+            let preamble_len = match strip_at {
+                Some((idx, len)) if idx == i => Some(len),
+                _ => None,
+            };
+            let stripped = crate::agent::memory_inject::strip_memory_context_preamble(
+                &msg.content,
+                preamble_len,
+            );
             if stripped.len() == msg.content.len() {
                 replayed.push(ConversationMessage::Chat(msg.clone()));
             } else {
@@ -2570,6 +2585,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
+        let mut loop_memory_preamble_len: Option<usize> = None;
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2638,6 +2654,7 @@ impl Agent {
                     ),
                     history: &mut loop_history,
                     history_has_trim_breadcrumb: &mut loop_history_crumb_present,
+                    memory_preamble_len: &mut loop_memory_preamble_len,
                     channel_name: &self.channel_name,
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -2728,15 +2745,18 @@ impl Agent {
             // appending `loop_new_messages` a second time — doing so duplicated
             // the current turn (5 messages instead of 3).
             self.history.clear();
-            self.history
-                .extend(Self::replay_loop_messages(&loop_history));
+            self.history.extend(Self::replay_loop_messages(
+                &loop_history,
+                loop_memory_preamble_len,
+            ));
             self.history_has_trim_breadcrumb = loop_history_crumb_present;
         } else {
             // No trim: the loop did not change the prefix. Pop the pre-loop
             // enriched user message and replay the canonical (which may be the
             // request-enriched form, not the raw `enriched` we pushed).
             self.history.pop();
-            for replayed in Self::replay_loop_messages(&loop_new_messages) {
+            for replayed in Self::replay_loop_messages(&loop_new_messages, loop_memory_preamble_len)
+            {
                 self.history.push(replayed);
             }
         }
@@ -2966,6 +2986,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
+        let mut loop_memory_preamble_len: Option<usize> = None;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         // Track total canonical ChatMessage length so prefix detection is not
         // confused by `sync_pending` which always grows `loop_history` via the
@@ -3114,6 +3135,7 @@ impl Agent {
                         ),
                         history: &mut loop_history,
                         history_has_trim_breadcrumb: &mut loop_history_crumb_present,
+                        memory_preamble_len: &mut loop_memory_preamble_len,
                         channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: cancel_token.clone(),
@@ -3204,7 +3226,15 @@ impl Agent {
                 self.history.pop();
                 new_msgs.pop();
             }
-            for replayed in Self::replay_loop_messages(&round_added) {
+            // The injected preamble can only land on round 0's user message
+            // (`turn::mod.rs` injects once, before the loop's first round);
+            // later rounds' `round_added` never carries it.
+            let round_memory_preamble_len = if round == 0 {
+                loop_memory_preamble_len
+            } else {
+                None
+            };
+            for replayed in Self::replay_loop_messages(&round_added, round_memory_preamble_len) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
             }
@@ -3221,8 +3251,10 @@ impl Agent {
                 // Rebuild durable history from the authoritative loop_history
                 // which already contains the trimmed prefix + canonical.
                 self.history.clear();
-                self.history
-                    .extend(Self::replay_loop_messages(&loop_history));
+                self.history.extend(Self::replay_loop_messages(
+                    &loop_history,
+                    loop_memory_preamble_len,
+                ));
                 self.history_has_trim_breadcrumb = loop_history_crumb_present;
                 streamed_original_loop_history_len = new_prefix_len;
                 streamed_original_crumb = loop_history_crumb_present;
@@ -3307,7 +3339,7 @@ impl Agent {
                     // assistant output (e.g. a persisted stream partial) when
                     // no prior round committed anything.
                     if committed_response.is_empty() {
-                        for replayed in Self::replay_loop_messages(&round_added) {
+                        for replayed in Self::replay_loop_messages(&round_added, None) {
                             if let ConversationMessage::Chat(message) = &replayed
                                 && message.role == "assistant"
                             {
@@ -3543,13 +3575,15 @@ mod tests {
     /// streamed trim paths.
     #[test]
     fn replay_loop_messages_strips_the_memory_context_preamble() {
-        let with_preamble = ChatMessage::user(format!(
-            "{}\n- k: recalled fact\n{}\n\nwhat's the weather like",
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
             zeroclaw_memory::MEMORY_CONTEXT_OPEN,
             zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
-        ));
+        );
+        let with_preamble = ChatMessage::user(format!("{preamble}what's the weather like"));
         let assistant = ChatMessage::assistant("it's sunny".to_string());
-        let replayed = Agent::replay_loop_messages(&[with_preamble, assistant]);
+        let replayed =
+            Agent::replay_loop_messages(&[with_preamble, assistant], Some(preamble.len()));
 
         let ConversationMessage::Chat(user_msg) = &replayed[0] else {
             panic!(
@@ -3563,6 +3597,32 @@ mod tests {
                 .content
                 .contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
             "durable history must never carry the recalled-memory preamble"
+        );
+    }
+
+    /// Regression: a genuine user message that merely starts with the same
+    /// marker text as a recalled-memory preamble must survive byte-for-byte
+    /// when no length was recorded for it — provenance is the caller's own
+    /// record of what it injected, never a match against the marker text.
+    #[test]
+    fn replay_loop_messages_preserves_a_user_message_that_looks_like_a_preamble() {
+        let looks_like_a_preamble = ChatMessage::user(format!(
+            "{}\n- k: a user-authored fact\n{}\n\nplease keep this text",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        ));
+        let original = looks_like_a_preamble.content.clone();
+        let replayed = Agent::replay_loop_messages(&[looks_like_a_preamble], None);
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            user_msg.content, original,
+            "a genuine user message must survive byte-for-byte without a recorded preamble length"
         );
     }
 

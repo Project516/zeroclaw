@@ -160,6 +160,7 @@ pub async fn maybe_run_skill_review(
                 // The review fork owns a fresh transcript: no prior trim ran,
                 // so no crumb exists and none can outlive this scoped loop.
                 history_has_trim_breadcrumb: &mut fork_crumb_present,
+                memory_preamble_len: &mut None,
                 // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,
