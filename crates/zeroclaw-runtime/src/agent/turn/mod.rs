@@ -208,13 +208,15 @@ pub struct ToolLoop<'a> {
     pub history_has_trim_breadcrumb: &'a mut bool,
     /// Out-param the loop writes through when it injects a recalled-memory
     /// preamble onto the last user message for this turn's provider request
-    /// only: the exact byte length of the injected block. The caller uses
-    /// this recorded length, not marker text, to strip precisely the block
-    /// this turn injected before writing history back to durable storage —
-    /// a genuine user message that happens to start with the marker text is
-    /// never touched, because provenance comes from what the loop itself
-    /// recorded doing, the same principle as `history_has_trim_breadcrumb`.
-    pub memory_preamble_len: &'a mut Option<usize>,
+    /// only: the exact rendered block. The caller strips this exact string
+    /// as a prefix, not a generic marker pattern, before writing history
+    /// back to durable storage — self-verifying against any buffer the
+    /// injection never actually touched (a separate pre-injection clone, or
+    /// a genuine user message that happens to start with the same marker
+    /// text), because a match only succeeds against the literal content
+    /// this turn rendered, the same recorded-not-inferred principle as
+    /// `history_has_trim_breadcrumb`.
+    pub injected_memory_preamble: &'a mut Option<String>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -926,7 +928,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         exec,
         history: raw_history,
         history_has_trim_breadcrumb,
-        memory_preamble_len,
+        injected_memory_preamble,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -1048,7 +1050,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             if !context.is_empty() {
                 let existing = &turn_state.history[last_user_idx].content;
                 turn_state.history[last_user_idx].content = format!("{context}{existing}");
-                *memory_preamble_len = Some(context.len());
+                *injected_memory_preamble = Some(context.clone());
             }
         }
     }
@@ -3108,7 +3110,7 @@ async fn drive_live_sop_actions(
                                     ),
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
-                                    memory_preamble_len: &mut None,
+                                    injected_memory_preamble: &mut None,
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
