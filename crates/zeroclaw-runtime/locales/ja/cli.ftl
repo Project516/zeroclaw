@@ -857,6 +857,7 @@ turn-max-iterations-reached = *ターン停止: ツールの最大反復回数 (
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 履歴メッセージ数の上限を超えました
+history-trim-reason-recovery = コンテキストウィンドウのオーバーフロー復旧
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
@@ -876,6 +877,7 @@ channel-runtime-model-empty = モデル ID は空にできません。`/model <m
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
 channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
 channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
+channel-runtime-history-unavailable = ⚠️ 会話履歴を今すぐ確認できませんでした。しばらくしてからもう一度お試しください。
 channel-runtime-no-reply-refused = 🚫 そのリクエストにはお応えできません。
 channel-runtime-no-reply-failed = ⚠️ そのリクエストを完了できませんでした。
 channel-runtime-current-model-status =

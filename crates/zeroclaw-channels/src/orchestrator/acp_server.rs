@@ -1179,6 +1179,11 @@ impl AcpServer {
             .iter()
             .map(|(message, _)| message.clone())
             .collect();
+        // Breadcrumb provenance is the store's canonical record alongside
+        // the transcript, never inferred from message text. Set it BEFORE
+        // seeding: seed-time trim reads the flag to decide whether a leading
+        // synthetic marker counts as a real turn.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
         let dropped_messages = match &restore_trim_event {
             Some(TurnEvent::HistoryTrimmed {
@@ -1190,8 +1195,28 @@ impl AcpServer {
         // boundary back to the original stored index so client replay starts
         // at the same retained turn even though repair may have removed seed
         // rows the stored transcript still contains.
+        //
+        // `dropped_messages` counts only real messages: a leading persisted
+        // synthetic breadcrumb is excluded by the crumb-aware trim but is
+        // still present in `seed_pairs`, so the seed-vector offset is the
+        // dropped count plus the leading crumb row.
+        let seed_crumbs = if data.trim_breadcrumb
+            && seed_pairs.first().is_some_and(|(message, _)| {
+                if let ConversationMessage::Chat(chat) = message {
+                    chat.role == "user"
+                        && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(
+                            &chat.content,
+                        )
+                } else {
+                    false
+                }
+            }) {
+            1
+        } else {
+            0
+        };
         let replay_from = seed_pairs
-            .get(dropped_messages)
+            .get(dropped_messages + seed_crumbs)
             .map(|(_, original_index)| *original_index)
             .unwrap_or(stored_messages.len());
 
@@ -1439,6 +1464,10 @@ impl AcpServer {
                 "ACP session/resume repaired interrupted tool calls in restored transcript"
             );
         }
+        // Breadcrumb provenance is the store's canonical record alongside
+        // the transcript, never inferred from message text. Set it BEFORE
+        // seeding: seed-time trim reads the flag.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
@@ -1835,25 +1864,44 @@ impl AcpServer {
                 Ok(success) => {
                     // Successful turns keep best-effort persistence: the client
                     // already has the response, so a persist failure is logged
-                    // but not surfaced.
-                    let _ = Self::append_transcript(
-                        persist_store,
-                        persist_session_id,
-                        success.new_messages,
-                    )
-                    .await;
+                    // but not surfaced. Persist the Agent's own full history
+                    // (plus its breadcrumb flag) rather than appending just
+                    // this turn's delta: the live Agent may already have
+                    // trimmed older turns, and appending the delta on top of
+                    // the pre-trim durable transcript would let a later
+                    // `session/load` resurrect turns the Agent dropped.
+                    if !success.new_messages.is_empty() {
+                        let full_history = session.agent.history().to_vec();
+                        let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
+                        let _ = Self::persist_terminal_transcript(
+                            persist_store,
+                            persist_session_id,
+                            full_history,
+                            trim_breadcrumb,
+                        )
+                        .await;
+                    }
                     TerminalOutcome::Success {
                         response: success.response,
                     }
                 }
-                Err(failure) if was_cancelled => {
+                Err(_failure) if was_cancelled => {
+                    // Snapshot the full history (and breadcrumb flag) before
+                    // any live-only mutation below, then project the same
+                    // client-facing cancellation event onto it, so the
+                    // durable write reflects any Agent-owned trim instead of
+                    // an append on top of a stale pre-trim transcript.
+                    let full_history =
+                        Self::cancelled_turn_transcript(session.agent.history().to_vec());
+                    let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
                     // The failed/cancelled durability contract is the whole point
                     // of this change, so retain a persistence failure and surface
                     // it to the caller instead of reporting a clean cancellation.
-                    let persist_error = Self::append_transcript(
+                    let persist_error = Self::persist_terminal_transcript(
                         persist_store,
                         persist_session_id,
-                        Self::cancelled_turn_transcript(failure.new_messages),
+                        full_history,
+                        trim_breadcrumb,
                     )
                     .await
                     .err();
@@ -1877,6 +1925,16 @@ impl AcpServer {
                     let persist_error = if failure.new_messages.is_empty() {
                         None
                     } else {
+                        // Snapshot the full history (and breadcrumb flag)
+                        // before degrading trailing media below: the durable
+                        // transcript keeps the original content for client
+                        // replay, while the live agent gets the degraded
+                        // version. Snapshotting here (rather than appending
+                        // `failure.new_messages` on top of the prior durable
+                        // transcript) also means any Agent-owned trim is
+                        // reflected in what gets persisted.
+                        let full_history = session.agent.history().to_vec();
+                        let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
                         // The failed turn is the trailing span of the live
                         // history (its prompt is the last user message and
                         // nothing appends after a failure). Its attachments
@@ -1898,10 +1956,11 @@ impl AcpServer {
                                 "Degraded rejected attachments in live ACP history after a failed turn"
                             );
                         }
-                        Self::append_transcript(
+                        Self::persist_terminal_transcript(
                             persist_store,
                             persist_session_id,
-                            Self::failed_turn_transcript(failure.new_messages),
+                            Self::failed_turn_transcript(full_history),
+                            trim_breadcrumb,
                         )
                         .await
                         .err()
@@ -2480,54 +2539,32 @@ impl AcpServer {
         repaired
     }
 
-    /// Durably append a turn's new messages to the ACP session store. Takes an
-    /// owned store handle rather than `&self` so terminal persistence can run
-    /// inside the per-session turn task while it still holds the session lock.
-    /// That ordering is what lets `session/close` and `session/stop` — which
-    /// await the same lock — observe the committed terminal transcript before
-    /// they return and before the session can be reloaded from stale rows.
-    /// Best-effort: an empty slice is a no-op, and a store error is logged while
-    /// the live session continues in memory. Shared by the successful, failed,
-    /// and cancelled turn paths so every terminal outcome preserves its
-    /// user-visible transcript across `session/load`.
-    /// Persist a terminal turn transcript. Returns `Ok(())` when the rows were
-    /// committed (or there was nothing to persist), and `Err(detail)` when the
-    /// SQLite append or its blocking task failed, so callers enforcing the
-    /// failed/cancelled durability contract can surface the loss instead of
-    /// reporting a clean terminal result.
-    async fn append_transcript(
+    /// Replace the durable ACP transcript with the agent's own authoritative
+    /// post-turn history, plus its breadcrumb flag, in one transaction. Used
+    /// by every terminal turn outcome (success, cancelled, failed) because the
+    /// live Agent may have already trimmed older turns before the turn
+    /// terminated: appending just the turn's delta on top of the prior
+    /// durable transcript would leave the trimmed turns behind for a later
+    /// `session/load` or restart to resurrect.
+    /// Mirrors the RPC ACP path's `persist_acp_turn` in
+    /// `zeroclaw_runtime::rpc::dispatch`.
+    async fn persist_terminal_transcript(
         store: Option<Arc<AcpSessionStore>>,
         session_id: String,
-        messages: Vec<ConversationMessage>,
+        full_history: Vec<ConversationMessage>,
+        trim_breadcrumb: bool,
     ) -> Result<(), String> {
         let Some(store) = store else {
             return Ok(());
         };
-        if messages.is_empty() {
-            return Ok(());
-        }
-        let persisted =
-            tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await;
-        let error = match persisted {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(join) => Some(join.to_string()),
-        };
-        match error {
-            None => Ok(()),
-            Some(detail) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": detail,
-                        })),
-                    "Failed to persist turn; session continues in memory"
-                );
-                Err(detail)
-            }
+        let persisted = tokio::task::spawn_blocking(move || {
+            store.replace_messages_and_breadcrumb(&session_id, &full_history, trim_breadcrumb)
+        })
+        .await;
+        match persisted {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(join) => Err(join.to_string()),
         }
     }
 
@@ -3218,18 +3255,45 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             dropped_messages,
             kept_turns,
             reason,
-        } => JsonRpcNotification {
-            jsonrpc: "2.0",
-            // ACP's SessionUpdate union is closed. Custom notifications use
-            // underscore-prefixed methods so clients can safely ignore them.
-            method: "_zeroclaw/history_trimmed",
-            params: serde_json::json!({
+            token_budget,
+            tokens_before,
+            tokens_after,
+            tokens_before_source,
+            tokens_after_source,
+            unsatisfiable_floor,
+        } => {
+            let mut params = serde_json::json!({
                 "sessionId": session_id,
                 "droppedMessages": dropped_messages,
                 "keptTurns": kept_turns,
                 "reason": reason,
-            }),
-        },
+            });
+            if let Some(token_budget) = token_budget {
+                params["tokenBudget"] = (*token_budget).into();
+            }
+            if let Some(tokens_before) = tokens_before {
+                params["tokensBefore"] = (*tokens_before).into();
+            }
+            if let Some(tokens_after) = tokens_after {
+                params["tokensAfter"] = (*tokens_after).into();
+            }
+            if let Some(tokens_before_source) = tokens_before_source {
+                params["tokensBeforeSource"] = tokens_before_source.as_str().into();
+            }
+            if let Some(tokens_after_source) = tokens_after_source {
+                params["tokensAfterSource"] = tokens_after_source.as_str().into();
+            }
+            if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+                params["unsatisfiableFloor"] = (*unsatisfiable_floor).into();
+            }
+            JsonRpcNotification {
+                jsonrpc: "2.0",
+                // ACP's SessionUpdate union is closed. Custom notifications use
+                // underscore-prefixed methods so clients can safely ignore them.
+                method: "_zeroclaw/history_trimmed",
+                params,
+            }
+        }
         TurnEvent::Plan { entries } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -5390,6 +5454,12 @@ mod tests {
                 dropped_messages: 12,
                 kept_turns: 3,
                 reason: "message limit".to_string(),
+                token_budget: Some(500_000),
+                tokens_before: Some(612_000),
+                tokens_after: Some(117_000),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                unsatisfiable_floor: None,
             },
         )
         .expect("history trim must produce an ACP notification");
@@ -5403,6 +5473,11 @@ mod tests {
                 "droppedMessages": 12,
                 "keptTurns": 3,
                 "reason": "message limit",
+                "tokenBudget": 500_000,
+                "tokensBefore": 612_000,
+                "tokensAfter": 117_000,
+                "tokensBeforeSource": "provider",
+                "tokensAfterSource": "calibrated",
             })
         );
         assert!(value["params"].get("update").is_none());
@@ -6320,6 +6395,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_load_replays_the_retained_turn_when_a_persisted_crumb_leads_the_seed() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // `dropped_messages` from the crumb-aware restore trim counts only
+        // real messages, but the persisted leading breadcrumb is still a row
+        // of the seed vector. The replay offset must skip that crumb row too:
+        // with [crumb, old turn, new turn] and one old turn dropped, replay
+        // must begin at the new turn, not at the old turn's assistant reply.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-load-crumb-replay";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        let crumb = ConversationMessage::Chat(ChatMessage::user(
+            zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string(),
+        ));
+        store
+            .append_turn(session_id, std::slice::from_ref(&crumb))
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("old request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+                ],
+            )
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("new request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("new answer")),
+                ],
+            )
+            .unwrap();
+        store.set_trim_breadcrumb(session_id, true).unwrap();
+
+        let mut config = make_test_config(cwd.path());
+        config
+            .runtime_profiles
+            .get_mut("default")
+            .unwrap()
+            .max_history_messages = Some(2);
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(message) = writer_rx.try_recv() {
+            notifications.push(serde_json::from_str::<serde_json::Value>(&message).unwrap());
+        }
+
+        let replayed_texts: Vec<String> = notifications
+            .iter()
+            .filter_map(|notification| {
+                notification["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            replayed_texts,
+            vec!["new request".to_string(), "new answer".to_string()],
+            "replay must begin at the first retained real turn, aligned with the provider seed: \
+             {replayed_texts:?}"
+        );
+        assert_eq!(
+            notifications[0]["method"], "_zeroclaw/history_trimmed",
+            "the restore trim event must still be emitted first"
+        );
+        assert!(
+            !replayed_texts
+                .iter()
+                .any(|text| text.contains("old request") || text.contains("old answer")),
+            "rows from the dropped turn must not be replayed"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_turn_transcript_persists_visible_work_and_reloads() {
         use zeroclaw_api::model_provider::{
             ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
@@ -6360,10 +6527,11 @@ mod tests {
             }]),
         ];
 
-        AcpServer::append_transcript(
+        AcpServer::persist_terminal_transcript(
             Some(Arc::clone(&store)),
             session_id.to_string(),
             AcpServer::failed_turn_transcript(failed_turn),
+            false,
         )
         .await
         .expect("failed-turn transcript must persist to a healthy store");
@@ -6414,6 +6582,148 @@ mod tests {
             }
             other => panic!("expected trailing failure sentinel, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn completed_turn_persistence_replaces_transcript_instead_of_appending_past_a_trim() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // Simulate a turn where the live Agent had already dropped an older
+        // turn (token-budget trim) by the time the terminal task persists:
+        // the durable store still holds the pre-trim transcript, but the
+        // Agent's own `history()` only has the retained turn plus the new
+        // one, with the breadcrumb flag set. Persisting via
+        // `persist_terminal_transcript` must replace the durable transcript
+        // with that authoritative post-trim state, not append the new
+        // messages on top of the stale pre-trim rows.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-completed-turn-trim";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("old question")),
+                    ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+                ],
+            )
+            .unwrap();
+
+        // The Agent's post-trim, post-turn history: the old turn is gone,
+        // replaced by the trim breadcrumb, followed by the new turn.
+        let full_history_after_trim = vec![
+            ConversationMessage::Chat(ChatMessage::assistant(
+                zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string(),
+            )),
+            ConversationMessage::Chat(ChatMessage::user("new question")),
+            ConversationMessage::Chat(ChatMessage::assistant("new answer")),
+        ];
+
+        AcpServer::persist_terminal_transcript(
+            Some(Arc::clone(&store)),
+            session_id.to_string(),
+            full_history_after_trim,
+            true,
+        )
+        .await
+        .expect("terminal persistence must succeed against a healthy store");
+
+        let data = store
+            .load_session(session_id)
+            .unwrap()
+            .expect("session record must exist");
+        assert!(
+            !data.messages.iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(chat) if chat.content.contains("old question") || chat.content.contains("old answer")
+            )),
+            "the trimmed turn must not survive as an appended row: {:?}",
+            data.messages
+        );
+        assert!(
+            data.messages.iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(chat) if chat.content == "new answer"
+            )),
+            "the new turn must be present: {:?}",
+            data.messages
+        );
+        assert!(
+            data.trim_breadcrumb,
+            "the breadcrumb flag must be committed with the replaced transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_persistence_replaces_transcript_instead_of_appending_past_a_trim() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // Same scenario as the completed-turn case above, but for a
+        // cooperatively cancelled turn: the cancellation projection is
+        // applied on top of the Agent's post-trim history, and the write
+        // must still replace the durable transcript rather than append.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-cancelled-turn-trim";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("old question")),
+                    ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+                ],
+            )
+            .unwrap();
+
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let full_history_after_trim = vec![
+            ConversationMessage::Chat(ChatMessage::assistant(
+                zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string(),
+            )),
+            ConversationMessage::Chat(ChatMessage::user("new question")),
+            ConversationMessage::Chat(ChatMessage::assistant(interrupted)),
+        ];
+        let projected = AcpServer::cancelled_turn_transcript(full_history_after_trim);
+
+        AcpServer::persist_terminal_transcript(
+            Some(Arc::clone(&store)),
+            session_id.to_string(),
+            projected,
+            true,
+        )
+        .await
+        .expect("terminal persistence must succeed against a healthy store");
+
+        let data = store
+            .load_session(session_id)
+            .unwrap()
+            .expect("session record must exist");
+        assert!(
+            !data.messages.iter().any(|m| matches!(
+                m,
+                ConversationMessage::Chat(chat) if chat.content.contains("old question") || chat.content.contains("old answer")
+            )),
+            "the trimmed turn must not survive as an appended row: {:?}",
+            data.messages
+        );
+        assert!(
+            data.messages.iter().any(AcpServer::is_cancellation_event),
+            "the structured cancellation event must be present: {:?}",
+            data.messages
+        );
+        assert!(
+            data.trim_breadcrumb,
+            "the breadcrumb flag must be committed with the replaced transcript"
+        );
     }
 
     #[test]
@@ -6599,10 +6909,10 @@ mod tests {
         use zeroclaw_api::model_provider::ConversationMessage;
 
         // Drive a populated, non-retryable provider failure through the real
-        // `session/prompt` handler (not the `append_transcript`/
+        // `session/prompt` handler (not the `persist_terminal_transcript`/
         // `failed_turn_transcript` helpers directly), so the `TerminalOutcome`
-        // routing and the production append path are exercised: a regression in
-        // the handler match would surface here.
+        // routing and the production persistence path are exercised: a
+        // regression in the handler match would surface here.
         struct FailingProvider;
         impl zeroclaw_api::attribution::Attributable for FailingProvider {
             fn role(&self) -> zeroclaw_api::attribution::Role {
@@ -6704,32 +7014,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_transcript_surfaces_persistence_failure() {
+    async fn persist_terminal_transcript_surfaces_persistence_failure() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
         let cwd = tempfile::tempdir().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
 
-        // `append_turn` errors for a session with no record. `append_transcript`
-        // must propagate that as `Err` so a failed/cancelled turn can surface the
-        // lost transcript instead of reporting a clean terminal result.
-        let failed = AcpServer::append_transcript(
+        // `replace_messages_and_breadcrumb` errors for a session with no
+        // record. `persist_terminal_transcript` must propagate that as `Err`
+        // so a failed/cancelled turn can surface the lost transcript instead
+        // of reporting a clean terminal result.
+        let failed = AcpServer::persist_terminal_transcript(
             Some(Arc::clone(&store)),
             "no-such-session".to_string(),
             vec![ConversationMessage::Chat(ChatMessage::user("hi"))],
+            false,
         )
         .await;
         assert!(
             failed.is_err(),
-            "a failed store append must surface as Err, not a silent success"
+            "a failed store write must surface as Err, not a silent success"
         );
 
-        // Nothing to persist stays a best-effort `Ok` no-op.
-        let empty =
-            AcpServer::append_transcript(Some(store), "no-such-session".to_string(), Vec::new())
-                .await;
-        assert!(empty.is_ok(), "an empty transcript is a no-op success");
+        // Unlike the old delta-append helper, an empty transcript is a
+        // legitimate full-history state (a session that produced no visible
+        // work), not a no-op: it must still commit against a known session.
+        let session_id = "persist-terminal-transcript-empty";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        let empty = AcpServer::persist_terminal_transcript(
+            Some(store),
+            session_id.to_string(),
+            Vec::new(),
+            false,
+        )
+        .await;
+        assert!(empty.is_ok(), "an empty full history still commits");
     }
 
     #[tokio::test]

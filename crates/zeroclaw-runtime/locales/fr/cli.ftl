@@ -862,6 +862,7 @@ turn-max-iterations-reached = *Tour arrêté : nombre maximal d’itérations d�
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = limite de messages de l’historique dépassée
+history-trim-reason-recovery = récupération après dépassement de la fenêtre de contexte
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]
@@ -881,6 +882,7 @@ channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
 channel-runtime-agent-scope-rejected = L'expéditeur `{ $sender }` n'est pas autorisé à utiliser `/model --agent` sur l'agent `{ $agent }`. Utilisez `/model --user { $model }` pour un remplacement limité à la session, ou demandez à un administrateur de marquer un groupe de pairs `admin_for_agent_scope = true` avec vous comme membre.
 channel-runtime-request-timeout = ⚠️ La requête a expiré en attendant le modèle. Veuillez réessayer.
+channel-runtime-history-unavailable = ⚠️ Impossible de vérifier votre historique de conversation pour le moment. Veuillez réessayer dans un instant.
 channel-runtime-no-reply-refused = 🚫 Je ne peux pas répondre à cette demande.
 channel-runtime-no-reply-failed = ⚠️ Je n'ai pas pu traiter cette demande.
 channel-runtime-current-model-status =

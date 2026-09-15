@@ -144,6 +144,17 @@ pub trait HookHandler: Send + Sync {
         HookResult::Continue(prompt)
     }
 
+    /// Inspect or rewrite the exact message vector about to be sent to the
+    /// provider. The general contract permits arbitrary mutation — insert,
+    /// delete, replace, or reorder — but the runtime's pre-dispatch trim path
+    /// (`zeroclaw_runtime::agent::turn`) narrows that for a single dispatch:
+    /// when a trim is needed to fit the configured context budget, it can
+    /// only rebuild the post-hook request without re-invoking this hook if
+    /// this call's mutation was a pure append (no change to any message at
+    /// or before the original length). A hook that inserts, deletes,
+    /// replaces, or reorders and is later trimmed causes that dispatch to
+    /// fail loudly instead of dispatching a request built on a broken
+    /// mapping back to durable turns.
     async fn before_llm_call(
         &self,
         _messages: &mut Vec<ChatMessage>,
