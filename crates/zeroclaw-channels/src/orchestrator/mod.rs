@@ -14579,7 +14579,10 @@ struct HydrationFailed;
 /// Returns `Ok(None)` for an empty/missing session and
 /// `Err(HydrationFailed)` when a transcript was loaded but its
 /// reconciliation write failed — callers must keep those distinct (see
-/// [`HydrationFailed`]).
+/// [`HydrationFailed`]). A trailing orphan turn's durable closure append is
+/// part of that reconciliation: publishing a closure that storage never
+/// accepted would leave the live cache ahead of durable storage until the
+/// next authoritative replacement.
 fn hydrate_session_transcript(
     store: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
@@ -14650,6 +14653,7 @@ fn hydrate_session_transcript(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 &format!("Failed to persist orphan closure for {session_key}")
             );
+            return Err(HydrationFailed);
         }
         msgs.push(closure);
         orphan_closed = true;
@@ -21124,6 +21128,66 @@ api_key = "anthropic-key"
         assert!(
             hydrate_session_transcript(&backend, "sender").is_err(),
             "a failed reconciliation write must be reported, not published as a truncated cache"
+        );
+    }
+
+    #[test]
+    fn hydration_fails_closed_when_the_orphan_closure_append_fails() {
+        // The transcript is readable and under the cap, so the only
+        // reconciliation write is the trailing orphan turn's durable closure
+        // append. When that append fails, hydration must not publish the
+        // closure in the returned transcript: a live cache containing an
+        // assistant row absent from durable storage would diverge until the
+        // next authoritative replacement, and a restart would drop the
+        // phantom row. Fail closed instead, leaving the session unreconciled
+        // for the next turn to retry.
+        use std::sync::Mutex as StdMutex;
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        struct ClosureAppendFailsBackend {
+            messages: StdMutex<Vec<ChatMessage>>,
+        }
+        impl SessionBackend for ClosureAppendFailsBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                self.messages.lock().unwrap().clone()
+            }
+            fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+                if msg.role == "assistant" {
+                    // The orphan closure is the only assistant write this
+                    // path attempts before hydration completes.
+                    return Err(std::io::Error::other("simulated closure append failure"));
+                }
+                self.messages.lock().unwrap().push(msg.clone());
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Ok(Some(false))
+            }
+        }
+
+        let backend = ClosureAppendFailsBackend {
+            messages: StdMutex::new(Vec::new()),
+        };
+        // Under the cap, ending on a user turn: hydration's only durable
+        // write is the orphan closure.
+        backend
+            .append("sender", &ChatMessage::user("open turn"))
+            .unwrap();
+
+        assert!(
+            hydrate_session_transcript(&backend, "sender").is_err(),
+            "a failed closure append must fail hydration, not publish a phantom assistant row"
+        );
+        assert_eq!(
+            backend.messages.lock().unwrap().len(),
+            1,
+            "the failed closure must not have been appended to durable storage"
         );
     }
 

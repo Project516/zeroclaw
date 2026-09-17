@@ -1191,6 +1191,39 @@ impl AcpServer {
             }) => *dropped_messages,
             _ => 0,
         };
+        if restore_trim_event.is_some() {
+            // The seed-time cap trimmed the seed, so the agent's live history
+            // no longer matches the durable transcript. Persist the retained
+            // projection and its provenance now: a client that loads an
+            // over-cap session and closes before another prompt would
+            // otherwise leave the store over-cap, and every later restart
+            // would repeat this same trim/replay reconciliation from stale
+            // rows. Best-effort: a persistence failure is logged and the
+            // in-memory session stays usable; the trim is re-derived on the
+            // next restore.
+            let retained = agent.history().to_vec();
+            let retained_crumbs = agent.history_has_trim_breadcrumb();
+            if let Err(e) = Self::persist_terminal_transcript(
+                Some(Arc::clone(store)),
+                session_id.clone(),
+                retained,
+                retained_crumbs,
+            )
+            .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": session_id,
+                            "error": e,
+                        })),
+                    "ACP session/load could not persist the restore-time trimmed projection"
+                );
+            }
+        }
         // Whole-turn trimming drops a prefix of the provider seed. Map that
         // boundary back to the original stored index so client replay starts
         // at the same retained turn even though repair may have removed seed
@@ -1469,7 +1502,33 @@ impl AcpServer {
         // seeding: seed-time trim reads the flag.
         agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
-
+        if restore_trim_event.is_some() {
+            // Persist the restore-time trimmed projection (see the
+            // `session/load` comment) so an over-cap session converges on
+            // disk instead of repeating the same trim on every restore.
+            let retained = agent.history().to_vec();
+            let retained_crumbs = agent.history_has_trim_breadcrumb();
+            if let Err(e) = Self::persist_terminal_transcript(
+                Some(Arc::clone(store)),
+                session_id.clone(),
+                retained,
+                retained_crumbs,
+            )
+            .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": session_id,
+                            "error": e,
+                        })),
+                    "ACP session/resume could not persist the restore-time trimmed projection"
+                );
+            }
+        }
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
             session_id.clone(),
@@ -1870,17 +1929,15 @@ impl AcpServer {
                     // trimmed older turns, and appending the delta on top of
                     // the pre-trim durable transcript would let a later
                     // `session/load` resurrect turns the Agent dropped.
-                    if !success.new_messages.is_empty() {
-                        let full_history = session.agent.history().to_vec();
-                        let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
-                        let _ = Self::persist_terminal_transcript(
-                            persist_store,
-                            persist_session_id,
-                            full_history,
-                            trim_breadcrumb,
-                        )
-                        .await;
-                    }
+                    let full_history = session.agent.history().to_vec();
+                    let trim_breadcrumb = session.agent.history_has_trim_breadcrumb();
+                    let _ = Self::persist_terminal_transcript(
+                        persist_store,
+                        persist_session_id,
+                        full_history,
+                        trim_breadcrumb,
+                    )
+                    .await;
                     TerminalOutcome::Success {
                         response: success.response,
                     }
@@ -1916,14 +1973,15 @@ impl AcpServer {
                 }
                 Err(failure) => {
                     let (error, rpc_error) = acp_turn_failure(&failure.error);
-                    // A rejected prompt (e.g. empty/whitespace) fails before
-                    // producing any transcript, leaving `new_messages` empty.
-                    // Keep the old no-write behavior there so repeating an
-                    // invalid request doesn't accrete assistant-only failure
-                    // markers into `session/load`. Only persist — with the
-                    // marker — when the turn produced visible work.
                     let persist_error = if failure.new_messages.is_empty() {
-                        None
+                        Self::persist_terminal_transcript(
+                            persist_store,
+                            persist_session_id,
+                            session.agent.history().to_vec(),
+                            session.agent.history_has_trim_breadcrumb(),
+                        )
+                        .await
+                        .err()
                     } else {
                         // Snapshot the full history (and breadcrumb flag)
                         // before degrading trailing media below: the durable
@@ -2561,11 +2619,20 @@ impl AcpServer {
             store.replace_messages_and_breadcrumb(&session_id, &full_history, trim_breadcrumb)
         })
         .await;
-        match persisted {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(join) => Err(join.to_string()),
-        }
+        let error = match persisted {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => e.to_string(),
+            Err(join) => join.to_string(),
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                .with_category(::zeroclaw_log::EventCategory::Channel)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"error": error})),
+            "Failed to persist ACP retained history"
+        );
+        Err(error)
     }
 
     fn prompt_result(session_id: String, stop_reason: &'static str, text: String) -> Value {

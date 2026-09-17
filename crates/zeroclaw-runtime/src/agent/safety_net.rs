@@ -2207,6 +2207,8 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
             },
         ),
         history: &mut history,
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,

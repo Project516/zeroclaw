@@ -1491,6 +1491,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // genuine floor (no further whole turn can be dropped and the
         // rebuilt request is still over budget) fails the turn below instead
         // of dispatching the request it just declared unsatisfiable.
+        if context_token_budget > 0
+            && tokens_before_dispatch > context_token_budget as u64
+            && !hook_only_appended
+        {
+            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                "turn-hook-mutation-unsupported-for-trim",
+            )));
+        }
         let mut trim_result = surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
@@ -1501,23 +1509,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
             || turn_state.crumb_present != crumb_before;
-        if history_was_trimmed && !hook_only_appended {
-            // The rebuild below drops whole durable turns from the post-hook
-            // prefix by position/count and re-appends `hook_suffix` at the
-            // end. That is only correct when the hook's own mutation this
-            // dispatch was a pure append: an insert, delete, replace, or
-            // reorder anywhere else in the vector breaks the assumed
-            // positional correspondence between the post-hook prefix and the
-            // durable turns it is supposed to mirror, and the rebuild could
-            // silently drop, duplicate, or misplace messages. Documented
-            // contract for THIS pre-dispatch trim seam only (the general
-            // `before_llm_call` hook contract in `zeroclaw-api` still allows
-            // arbitrary mutation): fail loudly instead of dispatching a
-            // request built on a broken mapping.
-            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
-                "turn-hook-mutation-unsupported-for-trim",
-            )));
-        }
         if history_was_trimmed {
             // Rebuild the post-hook request from the trimmed durable history,
             // re-measure it, and — if the authoritative rebuilt population is
@@ -4730,6 +4721,139 @@ mod hook_mutation_contract_tests {
             ChatMessage::assistant("second"),
             ChatMessage::user("third"),
         ]
+    }
+
+    #[tokio::test]
+    async fn insertion_before_history_refuses_dispatch_without_losing_turns() {
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct InsertingHook(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl HookHandler for InsertingHook {
+            fn name(&self) -> &str {
+                "insert-policy"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                messages.insert(1, ChatMessage::system("policy ".repeat(800)));
+                HookResult::Continue(())
+            }
+        }
+
+        struct UnexpectedProvider;
+
+        impl zeroclaw_api::attribution::Attributable for UnexpectedProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "unexpected-provider"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for UnexpectedProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                panic!("an unreconstructable request must not reach the provider")
+            }
+        }
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+            ChatMessage::assistant("second answer"),
+            ChatMessage::user("current question"),
+        ];
+        let before = serde_json::to_value(&history).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(InsertingHook(Arc::clone(&calls))));
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = crate::observability::NoopObserver;
+        let mut crumb_present = false;
+        let mut preamble = None;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let result = Box::pin(run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &UnexpectedProvider,
+                    provider_name: "test",
+                    model: "test-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 1,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 500,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: "hook-insertion",
+        }))
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            crate::i18n::get_required_cli_string("turn-hook-mutation-unsupported-for-trim")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(serde_json::to_value(&history).unwrap(), before);
+        assert!(!crumb_present);
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, TurnEvent::HistoryTrimmed { .. }));
+        }
     }
 
     #[test]
